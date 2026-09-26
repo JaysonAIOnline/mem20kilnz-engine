@@ -123,6 +123,27 @@ void Document::reset() {
     scene = Scene{};
     undo.clear();
     redo.clear();
+    journal.clear();
+}
+
+void Document::record(const nlohmann::json& op, const OpResult& r) {
+    nlohmann::json entry = nlohmann::json::object();
+    entry["op"] = op;
+    entry["ok"] = r.ok;
+    entry["message"] = r.message;
+    if (!r.data.is_null() && !(r.data.is_object() && r.data.empty())) entry["data"] = r.data;
+    journal.push_back(std::move(entry));
+    if (static_cast<int>(journal.size()) > max_journal) {
+        journal.erase(journal.begin(),
+                     journal.begin() + (static_cast<int>(journal.size()) - max_journal));
+    }
+}
+
+/// Single funnel for every applied op, so early returns are journaled too.
+OpResult apply_op(Document& doc, const nlohmann::json& op) {
+    OpResult r = apply_op_impl(doc, op);
+    doc.record(op, r);
+    return r;
 }
 
 int ensure_default_camera(Scene& s) {
@@ -156,7 +177,7 @@ int ensure_default_sun(Scene& s) {
     return s.add_node(L);
 }
 
-OpResult apply_op(Document& doc, const nlohmann::json& op) {
+OpResult apply_op_impl(Document& doc, const nlohmann::json& op) {
     if (!op.is_object() || !op.contains("op")) return fail("op object requires 'op'");
     std::string kind = op["op"].get<std::string>();
     Scene& s = doc.scene;

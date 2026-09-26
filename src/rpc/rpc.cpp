@@ -194,6 +194,42 @@ bool m_list(Session& s, const json&, json& result, int&, std::string&, json&) {
     return true;
 }
 
+/// The provenance record: every op applied in this session, in order, with its
+/// verdict. `clear` empties it without touching the scene.
+bool m_journal(Session& s, const json& params, json& result, int&, std::string&, json&) {
+    if (params.is_object() && params.value("clear", false)) {
+        int n = static_cast<int>(s.doc.journal.size());
+        s.doc.journal.clear();
+        result = json::object();
+        result["cleared"] = n;
+        result["count"] = 0;
+        result["total"] = 0;
+        result["failed"] = 0;
+        result["entries"] = json::array();
+        return true;
+    }
+    int since = 0;
+    if (params.is_object() && params.contains("since")) {
+        since = std::max(0, params["since"].get<int>());
+    }
+    if (since > static_cast<int>(s.doc.journal.size())) since = static_cast<int>(s.doc.journal.size());
+    json entries = json::array();
+    for (int i = since; i < static_cast<int>(s.doc.journal.size()); ++i) {
+        entries.push_back(s.doc.journal[static_cast<std::size_t>(i)]);
+    }
+    int total = static_cast<int>(s.doc.journal.size());
+    int failed = 0;
+    for (const auto& e : s.doc.journal) {
+        if (e.value("ok", true) == false) ++failed;
+    }
+    result = json::object();
+    result["count"] = static_cast<int>(entries.size());
+    result["total"] = total;
+    result["failed"] = failed;
+    result["entries"] = std::move(entries);
+    return true;
+}
+
 bool m_info(Session& s, const json& params, json& result, int& code, std::string& message, json& data) {
     Scene& sc = s.doc.scene;
     int i = sc.selection;
@@ -540,6 +576,7 @@ int run_rpc(Session& s) {
         else if (method == "command") ok = m_command(s, params, result, code, message, data);
         else if (method == "describe") ok = m_describe(s, params, result, code, message, data);
         else if (method == "list") ok = m_list(s, params, result, code, message, data);
+        else if (method == "journal") ok = m_journal(s, params, result, code, message, data);
         else if (method == "info") ok = m_info(s, params, result, code, message, data);
         else if (method == "samples") ok = m_samples(s, params, result, code, message, data);
         else if (method == "render") ok = m_render(s, params, result, code, message, data);
