@@ -1,0 +1,6 @@
+/build/
+/kiln
+*.o
+*.spv
+.cache/
+compile_commands.json

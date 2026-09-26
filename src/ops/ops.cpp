@@ -1,0 +1,1326 @@
+#include "ops.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <map>
+#include <set>
+#include <sstream>
+
+namespace kiln {
+namespace {
+
+std::string require_str(const nlohmann::json& j, const char* k, const std::string& d = {}) {
+    if (j.contains(k) && j[k].is_string()) return j[k].get<std::string>();
+    return d;
+}
+
+Vec3 require_vec3(const nlohmann::json& j, const char* k, Vec3 d = {}) {
+    if (!j.contains(k)) return d;
+    const auto& v = j[k];
+    if (v.is_array() && v.size() >= 3) return {v[0].get<float>(), v[1].get<float>(), v[2].get<float>()};
+    return d;
+}
+
+bool finite(float x) { return x == x && x > -3.0e38f && x < 3.0e38f; }
+
+float require_f(const nlohmann::json& j, const char* k, float d = 0) {
+    if (!j.contains(k)) return d;
+    if (j[k].is_number()) return j[k].get<float>();
+    return d;
+}
+
+int resolve_node(Scene& s, const nlohmann::json& op) {
+    if (op.contains("id") && op["id"].is_number_integer()) return s.find_node_id(op["id"].get<uint32_t>());
+    if (op.contains("target") && op["target"].is_string()) return s.find_node(op["target"].get<std::string>());
+    if (op.contains("name") && op["name"].is_string() && op.value("op", "") != "create")
+        return s.find_node(op["name"].get<std::string>());
+    return s.selection;
+}
+
+int add_material(Scene& s, Vec3 albedo) {
+    Material m;
+    m.name = "Material";
+    m.albedo = albedo;
+    s.materials.push_back(m);
+    return static_cast<int>(s.materials.size()) - 1;
+}
+
+OpResult fail(const std::string& m) { return {false, m}; }
+OpResult ok(const std::string& m) { return {true, m}; }
+
+bool parse_axis(const std::string& s, Vec3& out) {
+    std::string k = s;
+    for (char& c : k) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (k == "x" || k == "+x") out = {1, 0, 0};
+    else if (k == "y" || k == "+y" || k == "vertical") out = {0, 1, 0};
+    else if (k == "z" || k == "+z") out = {0, 0, 1};
+    else if (k == "horizontal") out = {1, 0, 0};
+    else return false;
+    return true;
+}
+
+Edge edge_from_json(const nlohmann::json& j) {
+    if (j.is_array() && j.size() >= 2 && j[0].is_number() && j[1].is_number())
+        return make_edge(j[0].get<uint32_t>(), j[1].get<uint32_t>());
+    return {};
+}
+
+std::vector<uint32_t> current_verts(const Scene& s, const Mesh& mesh) {
+    // A selection can outlive an edit that shrank the mesh. Never hand a stale
+    // index to a vertex op.
+    auto live = [&](std::vector<uint32_t> v) {
+        v.erase(std::remove_if(v.begin(), v.end(), [&](uint32_t i) { return i >= mesh.positions.size(); }), v.end());
+        return v;
+    };
+    if (s.edit_mode == EditMode::Vert && !s.vert_sel.empty()) return live(s.vert_sel);
+    if (!s.face_sel.empty()) return live(verts_of_faces(mesh, s.face_sel));
+    if (!s.edge_sel.empty()) {
+        std::set<uint32_t> u;
+        for (Edge e : s.edge_sel) {
+            u.insert(e.a);
+            u.insert(e.b);
+        }
+        return live({u.begin(), u.end()});
+    }
+    std::vector<uint32_t> all(mesh.positions.size());
+    for (size_t i = 0; i < all.size(); ++i) all[i] = uint32_t(i);
+    return all;
+}
+
+}  // namespace
+
+void Document::push_undo() {
+    undo.push_back(scene_to_json(scene));
+    if (static_cast<int>(undo.size()) > max_undo) undo.erase(undo.begin());
+    redo.clear();
+}
+
+bool Document::undo_once() {
+    if (undo.empty()) return false;
+    redo.push_back(scene_to_json(scene));
+    scene_from_json(undo.back(), scene);
+    undo.pop_back();
+    return true;
+}
+
+bool Document::redo_once() {
+    if (redo.empty()) return false;
+    undo.push_back(scene_to_json(scene));
+    scene_from_json(redo.back(), scene);
+    redo.pop_back();
+    return true;
+}
+
+void Document::reset() {
+    scene = Scene{};
+    undo.clear();
+    redo.clear();
+}
+
+int ensure_default_camera(Scene& s) {
+    if (s.active_camera >= 0 && s.active_camera < static_cast<int>(s.nodes.size())) return s.active_camera;
+    for (int i = 0; i < static_cast<int>(s.nodes.size()); ++i) {
+        if (s.nodes[i].type == NodeType::Camera) {
+            s.active_camera = i;
+            return i;
+        }
+    }
+    Node cam;
+    cam.type = NodeType::Camera;
+    cam.name = "Camera";
+    cam.translation = {4.2f, 2.8f, 5.4f};
+    cam.rotation_deg = {-22.0f, 38.0f, 0};
+    cam.fov_deg = 50;
+    s.active_camera = s.add_node(cam);
+    return s.active_camera;
+}
+
+int ensure_default_sun(Scene& s) {
+    for (int i = 0; i < static_cast<int>(s.nodes.size()); ++i) {
+        if (s.nodes[i].type == NodeType::Light) return i;
+    }
+    Node L;
+    L.type = NodeType::Light;
+    L.name = "Sun";
+    L.light = LightType::Sun;
+    L.rotation_deg = {-50, 35, 0};
+    L.light_intensity = 1.15f;
+    return s.add_node(L);
+}
+
+OpResult apply_op(Document& doc, const nlohmann::json& op) {
+    if (!op.is_object() || !op.contains("op")) return fail("op object requires 'op'");
+    std::string kind = op["op"].get<std::string>();
+    Scene& s = doc.scene;
+
+    if (kind == "new") {
+        doc.reset();
+        return ok("new scene");
+    }
+    if (kind == "undo") return doc.undo_once() ? ok("undo") : fail("nothing to undo");
+    if (kind == "redo") return doc.redo_once() ? ok("redo") : fail("nothing to redo");
+
+    bool mutates = kind != "select" && kind != "select_faces" && kind != "select_edges" &&
+                   kind != "select_edge_loop" && kind != "select_edge_ring" && kind != "select_verts" &&
+                   kind != "grow" && kind != "invert" && kind != "linked" && kind != "select_more" &&
+                   kind != "mode" && kind != "list" && kind != "info" && kind != "describe";
+    if (mutates) doc.push_undo();
+
+    if (kind == "create") {
+        std::string prims = require_str(op, "primitive", "cube");
+        PrimType prim;
+        if (!parse_prim(prims, prim)) {
+            if (prims == "camera") {
+                Node n;
+                n.type = NodeType::Camera;
+                n.name = require_str(op, "name", "Camera");
+                n.translation = require_vec3(op, "translation", {4, 3, 5});
+                n.rotation_deg = require_vec3(op, "rotation", {-20, 35, 0});
+                n.fov_deg = require_f(op, "fov", 50);
+                int i = s.add_node(n);
+                s.active_camera = i;
+                s.selection = i;
+                return ok("created camera " + s.nodes[i].name);
+            }
+            if (prims == "light" || prims == "sun" || prims == "point") {
+                Node n;
+                n.type = NodeType::Light;
+                n.name = require_str(op, "name", prims == "point" ? "Point" : "Sun");
+                n.light = (prims == "point") ? LightType::Point : LightType::Sun;
+                n.translation = require_vec3(op, "translation", {0, 3, 0});
+                n.rotation_deg = require_vec3(op, "rotation", {-50, 30, 0});
+                n.light_color = require_vec3(op, "albedo", n.light_color);
+                n.light_intensity = require_f(op, "intensity", 1);
+                int i = s.add_node(n);
+                s.selection = i;
+                return ok("created light " + s.nodes[i].name);
+            }
+            if (prims == "empty") {
+                Node n;
+                n.type = NodeType::Empty;
+                n.name = require_str(op, "name", "Empty");
+                n.translation = require_vec3(op, "translation");
+                int i = s.add_node(n);
+                s.selection = i;
+                return ok("created empty " + s.nodes[i].name);
+            }
+            if (mutates) doc.undo_once();
+            return fail("unknown primitive '" + prims + "'");
+        }
+        Vec3 size = require_vec3(op, "size", {1, 1, 1});
+        if (prim == PrimType::Plane && size.z == 1 && size.x != 1) size.z = size.x;
+        Mesh mesh = make_primitive(prim, size, static_cast<int>(require_f(op, "segments", 24)));
+        s.meshes.push_back(std::move(mesh));
+        int mi = static_cast<int>(s.meshes.size()) - 1;
+        Vec3 albedo = require_vec3(op, "albedo", {0.72f, 0.73f, 0.76f});
+        int mati = add_material(s, albedo);
+        if (op.contains("roughness")) s.materials[mati].roughness = require_f(op, "roughness", 0.45f);
+        if (op.contains("metallic")) s.materials[mati].metallic = require_f(op, "metallic", 0);
+        Node n;
+        n.type = NodeType::Mesh;
+        n.name = require_str(op, "name", prim_name(prim));
+        if (!n.name.empty()) n.name[0] = static_cast<char>(std::toupper(n.name[0]));
+        n.mesh = mi;
+        n.material = mati;
+        n.translation = require_vec3(op, "translation");
+        n.rotation_deg = require_vec3(op, "rotation");
+        n.scale = require_vec3(op, "scale", {1, 1, 1});
+        int i = s.add_node(n);
+        s.selection = i;
+        s.edit_mode = EditMode::Object;
+        s.face_sel.clear();
+        s.edge_sel.clear();
+        return ok("created " + s.nodes[i].name);
+    }
+
+    if (kind == "delete") {
+        int i = resolve_node(s, op);
+        if (i < 0) return fail("delete: no target");
+        std::string name = s.nodes[i].name;
+        s.remove_node_at(i);
+        return ok("deleted " + name);
+    }
+
+    if (kind == "duplicate") {
+        int i = resolve_node(s, op);
+        if (i < 0) return fail("duplicate: no target");
+        Node n = s.nodes[i];
+        n.id = 0;
+        n.name = require_str(op, "name", n.name);
+        n.translation.x += 1.0f;
+        int ni = s.add_node(n);
+        s.selection = ni;
+        return ok("duplicated " + s.nodes[ni].name);
+    }
+
+    if (kind == "rename") {
+        int i = resolve_node(s, op);
+        if (i < 0) return fail("rename: no target");
+        std::string nn = require_str(op, "to", require_str(op, "new_name"));
+        if (nn.empty()) return fail("rename: missing to");
+        s.nodes[i].name = s.unique_name(nn);
+        return ok("renamed " + s.nodes[i].name);
+    }
+
+    if (kind == "select") {
+        if (op.contains("target") && (op["target"] == "none" || op["target"] == "")) {
+            s.selection = -1;
+            return ok("cleared selection");
+        }
+        int i = resolve_node(s, op);
+        if (i < 0) return fail("select: not found");
+        s.selection = i;
+        s.edit_mode = EditMode::Object;
+        s.face_sel.clear();
+        s.edge_sel.clear();
+        s.vert_sel.clear();
+        return ok("selected " + s.nodes[i].name);
+    }
+
+    if (kind == "mode") {
+        std::string md = require_str(op, "mode", "object");
+        if (md == "face" || md == "faces") s.edit_mode = EditMode::Face;
+        else if (md == "edge" || md == "edges") s.edit_mode = EditMode::Edge;
+        else if (md == "vert" || md == "vertex" || md == "verts" || md == "vertices")
+            s.edit_mode = EditMode::Vert;
+        else {
+            s.edit_mode = EditMode::Object;
+            s.face_sel.clear();
+            s.edge_sel.clear();
+            s.vert_sel.clear();
+        }
+        return ok(std::string("mode ") + edit_mode_name(s.edit_mode));
+    }
+
+    if (kind == "select_faces") {
+        int i = resolve_node(s, op);
+        if (i < 0) i = s.selection;
+        if (i < 0) return fail("select_faces: no mesh");
+        s.selection = i;
+        Node& n = s.nodes[i];
+        if (n.mesh < 0) return fail("select_faces: not a mesh");
+        Mesh& mesh = s.meshes[n.mesh];
+        mesh_ensure_faces(mesh);
+        std::vector<int> faces;
+        if (op.contains("region") && op["region"].is_string()) {
+            faces = faces_matching(mesh, op["region"].get<std::string>());
+        } else if (op.contains("faces") && op["faces"].is_array()) {
+            for (const auto& x : op["faces"]) {
+                if (x.is_number_integer()) faces.push_back(x.get<int>());
+            }
+        }
+        s.edit_mode = EditMode::Face;
+        s.face_sel = std::move(faces);
+        s.edge_sel.clear();
+        s.vert_sel.clear();
+        return ok("selected " + std::to_string(s.face_sel.size()) + " faces on " + n.name);
+    }
+
+    if (kind == "select_edges") {
+        Mesh* mesh = nullptr;
+        int i = resolve_node(s, op);
+        if (i < 0) i = s.selection;
+        if (i >= 0) s.selection = i;
+        mesh = s.selected_mesh();
+        if (!mesh) return fail("select_edges: no mesh");
+        mesh_ensure_faces(*mesh);
+        std::vector<Edge> edges;
+        if (op.contains("region") && op["region"].is_string()) {
+            auto faces = faces_matching(*mesh, op["region"].get<std::string>());
+            edges = edges_of_faces(*mesh, faces);
+        } else if (op.contains("axis") && op["axis"].is_string()) {
+            Vec3 ax;
+            if (parse_axis(op["axis"].get<std::string>(), ax)) {
+                Edge e = pick_edge_axis(*mesh, ax);
+                edges = edge_loop(*mesh, e);
+            }
+        } else if (op.contains("edges") && op["edges"].is_array()) {
+            for (const auto& x : op["edges"]) {
+                Edge e = edge_from_json(x);
+                if (e.a != e.b) edges.push_back(e);
+            }
+        }
+        s.edit_mode = EditMode::Edge;
+        s.edge_sel = std::move(edges);
+        s.face_sel.clear();
+        s.vert_sel.clear();
+        return ok("selected " + std::to_string(s.edge_sel.size()) + " edges");
+    }
+
+    if (kind == "select_edge_loop" || kind == "select_edge_ring") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("edge loop: no mesh");
+        mesh_ensure_faces(*mesh);
+        Edge seed{};
+        if (op.contains("edge")) seed = edge_from_json(op["edge"]);
+        else if (!s.edge_sel.empty()) seed = s.edge_sel[0];
+        else if (op.contains("region") && op["region"].is_string()) {
+            auto faces = faces_matching(*mesh, op["region"].get<std::string>());
+            auto es = edges_of_faces(*mesh, faces);
+            if (!es.empty()) seed = es[0];
+        } else if (op.contains("axis") && op["axis"].is_string()) {
+            Vec3 ax;
+            if (parse_axis(op["axis"].get<std::string>(), ax)) seed = pick_edge_axis(*mesh, ax);
+        }
+        if (seed.a == seed.b && seed.a == 0) {
+            if (!mesh->faces.empty() && mesh->faces[0].v.size() >= 2)
+                seed = make_edge(mesh->faces[0].v[0], mesh->faces[0].v[1]);
+        }
+        auto got = (kind == "select_edge_ring") ? edge_ring(*mesh, seed) : edge_loop(*mesh, seed);
+        s.edit_mode = EditMode::Edge;
+        s.edge_sel = std::move(got);
+        s.face_sel.clear();
+        s.vert_sel.clear();
+        return ok(std::string(kind == "select_edge_ring" ? "ring " : "loop ") +
+                  std::to_string(s.edge_sel.size()) + " edges");
+    }
+
+    if (kind == "select_verts" || kind == "select_vertices") {
+        Mesh* mesh = s.selected_mesh();
+        int i = resolve_node(s, op);
+        if (i < 0) i = s.selection;
+        if (i >= 0) s.selection = i;
+        mesh = s.selected_mesh();
+        if (!mesh) return fail("select_verts: no mesh");
+        mesh_ensure_faces(*mesh);
+        std::vector<uint32_t> verts;
+        if (op.contains("region") && op["region"].is_string()) {
+            verts = verts_matching(*mesh, op["region"].get<std::string>());
+        } else if (op.contains("verts") && op["verts"].is_array()) {
+            for (const auto& x : op["verts"]) {
+                if (x.is_number()) {
+                    if (x.is_number_float()) verts.push_back(uint32_t(x.get<float>()));
+                    else verts.push_back(x.get<uint32_t>());
+                }
+            }
+        } else if (!s.face_sel.empty()) {
+            verts = verts_of_faces(*mesh, s.face_sel);
+        } else if (!s.edge_sel.empty()) {
+            std::set<uint32_t> u;
+            for (Edge e : s.edge_sel) {
+                u.insert(e.a);
+                u.insert(e.b);
+            }
+            verts.assign(u.begin(), u.end());
+        }
+        s.edit_mode = EditMode::Vert;
+        s.vert_sel = std::move(verts);
+        s.face_sel.clear();
+        s.edge_sel.clear();
+        return ok("selected " + std::to_string(s.vert_sel.size()) + " verts");
+    }
+
+    if (kind == "extrude") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("extrude: no mesh");
+        mesh_ensure_faces(*mesh);
+        std::vector<int> faces = s.face_sel;
+        if (faces.empty() && op.contains("region") && op["region"].is_string())
+            faces = faces_matching(*mesh, op["region"].get<std::string>());
+        if (faces.empty()) return fail("extrude: no faces selected");
+        float amt = require_f(op, "amount", 0.35f);
+        std::vector<int> neu;
+        if (!extrude_faces(*mesh, faces, amt, neu)) {
+            if (mutates) doc.undo_once();
+            return fail("extrude failed");
+        }
+        s.edit_mode = EditMode::Face;
+        s.face_sel = neu;
+        return ok("extruded " + std::to_string(neu.size()) + " faces by " + std::to_string(amt));
+    }
+
+    if (kind == "inset") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("inset: no mesh");
+        mesh_ensure_faces(*mesh);
+        std::vector<int> faces = s.face_sel;
+        if (faces.empty() && op.contains("region") && op["region"].is_string())
+            faces = faces_matching(*mesh, op["region"].get<std::string>());
+        if (faces.empty()) return fail("inset: no faces selected");
+        float amt = require_f(op, "amount", 0.15f);
+        std::vector<int> neu;
+        if (!inset_faces(*mesh, faces, amt, neu)) {
+            if (mutates) doc.undo_once();
+            return fail("inset failed");
+        }
+        s.face_sel = neu;
+        s.edit_mode = EditMode::Face;
+        return ok("inset " + std::to_string(neu.size()) + " faces");
+    }
+
+    if (kind == "delete_faces") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("delete_faces: no mesh");
+        mesh_ensure_faces(*mesh);
+        std::vector<int> faces = s.face_sel;
+        if (faces.empty() && op.contains("region") && op["region"].is_string())
+            faces = faces_matching(*mesh, op["region"].get<std::string>());
+        if (faces.empty()) return fail("delete_faces: no faces");
+        if (!delete_faces_mesh(*mesh, faces)) {
+            if (mutates) doc.undo_once();
+            return fail("delete_faces failed");
+        }
+        s.face_sel.clear();
+        return ok("deleted faces");
+    }
+
+    if (kind == "loop_cut" || kind == "loopcut") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("loop_cut: no mesh");
+        mesh_ensure_faces(*mesh);
+        Edge seed{};
+        if (op.contains("edge")) seed = edge_from_json(op["edge"]);
+        else if (!s.edge_sel.empty()) seed = s.edge_sel[0];
+        else if (op.contains("axis") && op["axis"].is_string()) {
+            Vec3 ax;
+            if (parse_axis(op["axis"].get<std::string>(), ax)) seed = pick_edge_axis(*mesh, ax);
+        } else if (op.contains("region") && op["region"].is_string()) {
+            auto faces = faces_matching(*mesh, op["region"].get<std::string>());
+            auto es = edges_of_faces(*mesh, faces);
+            if (!es.empty()) seed = es[0];
+        }
+        if (seed.a == seed.b) seed = pick_edge_axis(*mesh, {0, 1, 0});
+        int cuts = 1;
+        if (op.contains("cuts") && op["cuts"].is_number()) cuts = std::max(1, int(op["cuts"].get<float>()));
+        if (op.contains("count") && op["count"].is_number()) cuts = std::max(1, int(op["count"].get<float>()));
+        std::vector<Edge> neu;
+        if (!loop_cut(*mesh, seed, cuts, neu)) {
+            if (mutates) doc.undo_once();
+            return fail("loop_cut failed");
+        }
+        s.edit_mode = EditMode::Edge;
+        s.edge_sel = std::move(neu);
+        s.face_sel.clear();
+        return ok("loop cut x" + std::to_string(cuts));
+    }
+
+    if (kind == "bevel") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("bevel: no mesh");
+        mesh_ensure_faces(*mesh);
+        std::vector<Edge> edges = s.edge_sel;
+        if (edges.empty() && !s.face_sel.empty()) edges = edges_of_faces(*mesh, s.face_sel);
+        if (edges.empty() && op.contains("region") && op["region"].is_string()) {
+            auto faces = faces_matching(*mesh, op["region"].get<std::string>());
+            edges = edges_of_faces(*mesh, faces);
+        }
+        if (edges.empty()) return fail("bevel: no edges");
+        float amt = require_f(op, "amount", 0.12f);
+        std::vector<Edge> neu;
+        if (!bevel_edges(*mesh, edges, amt, neu)) {
+            if (mutates) doc.undo_once();
+            return fail("bevel failed");
+        }
+        s.edit_mode = EditMode::Edge;
+        s.edge_sel = std::move(neu);
+        s.face_sel.clear();
+        return ok("bevelled " + std::to_string(edges.size()) + " edges");
+    }
+
+    if (kind == "subdivide" || kind == "subdiv") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("subdivide: no mesh");
+        int cuts = 1;
+        if (op.contains("cuts") && op["cuts"].is_number()) cuts = std::max(1, int(op["cuts"].get<float>()));
+        if (op.contains("count") && op["count"].is_number()) cuts = std::max(1, int(op["count"].get<float>()));
+        std::vector<int> faces = s.face_sel;
+        if (faces.empty() && op.contains("region") && op["region"].is_string())
+            faces = faces_matching(*mesh, op["region"].get<std::string>());
+        std::vector<int> neu;
+        if (!subdivide_faces(*mesh, faces, cuts, neu)) {
+            if (mutates) doc.undo_once();
+            return fail("subdivide failed");
+        }
+        s.edit_mode = EditMode::Face;
+        s.face_sel = neu;
+        s.edge_sel.clear();
+        s.vert_sel.clear();
+        return ok("subdivided to " + std::to_string(mesh->faces.size()) + " faces");
+    }
+
+    if (kind == "merge" || kind == "weld") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("merge: no mesh");
+        std::vector<uint32_t> verts = s.vert_sel;
+        if (verts.empty() && !s.face_sel.empty()) verts = verts_of_faces(*mesh, s.face_sel);
+        if (verts.empty() && !s.edge_sel.empty()) {
+            std::set<uint32_t> u;
+            for (Edge e : s.edge_sel) {
+                u.insert(e.a);
+                u.insert(e.b);
+            }
+            verts.assign(u.begin(), u.end());
+        }
+        if (verts.empty() && op.contains("region") && op["region"].is_string())
+            verts = verts_matching(*mesh, op["region"].get<std::string>());
+        uint32_t survivor = 0;
+        if (!merge_verts(*mesh, verts, survivor)) {
+            if (mutates) doc.undo_once();
+            return fail("merge: need 2+ verts");
+        }
+        s.edit_mode = EditMode::Vert;
+        s.vert_sel = {survivor};
+        s.face_sel.clear();
+        s.edge_sel.clear();
+        return ok("merged to vert " + std::to_string(survivor));
+    }
+
+    if (kind == "fill") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("fill: no mesh");
+        std::vector<Edge> edges = s.edge_sel;
+        if (edges.empty() && s.vert_sel.size() >= 3) {
+            for (size_t i = 0; i < s.vert_sel.size(); ++i)
+                edges.push_back(make_edge(s.vert_sel[i], s.vert_sel[(i + 1) % s.vert_sel.size()]));
+        }
+        std::vector<int> neu;
+        if (!fill_loops(*mesh, edges, neu)) {
+            if (mutates) doc.undo_once();
+            return fail("fill: no loop");
+        }
+        s.edit_mode = EditMode::Face;
+        s.face_sel = neu;
+        s.edge_sel.clear();
+        s.vert_sel.clear();
+        return ok("filled " + std::to_string(neu.size()) + " faces");
+    }
+
+    if (kind == "mirror") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("mirror: no mesh");
+        int axis = 0;
+        Vec3 ax;
+        std::string as = require_str(op, "axis", "x");
+        if (parse_axis(as, ax)) {
+            if (std::abs(ax.y) > 0.5f) axis = 1;
+            else if (std::abs(ax.z) > 0.5f) axis = 2;
+            else axis = 0;
+        }
+        if (!mirror_mesh(*mesh, axis)) {
+            if (mutates) doc.undo_once();
+            return fail("mirror failed");
+        }
+        s.face_sel.clear();
+        s.edge_sel.clear();
+        s.vert_sel.clear();
+        s.edit_mode = EditMode::Object;
+        return ok(std::string("mirrored ") + (axis == 1 ? "y" : axis == 2 ? "z" : "x"));
+    }
+
+    if (kind == "solidify") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("solidify: no mesh");
+        float t = require_f(op, "thickness", require_f(op, "amount", 0.08f));
+        if (!solidify_mesh(*mesh, t)) {
+            if (mutates) doc.undo_once();
+            return fail("solidify failed");
+        }
+        s.face_sel.clear();
+        s.edge_sel.clear();
+        s.vert_sel.clear();
+        s.edit_mode = EditMode::Object;
+        return ok("solidified " + std::to_string(t));
+    }
+
+    if (kind == "array") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("array: no mesh");
+        int count = 3;
+        if (op.contains("count") && op["count"].is_number()) count = std::max(2, int(op["count"].get<float>()));
+        Vec3 off = require_vec3(op, "offset", {0, 0, 0});
+        if (length(off) < 1e-6f) {
+            Vec3 ax{1, 0, 0};
+            parse_axis(require_str(op, "axis", "x"), ax);
+            float sp = require_f(op, "spacing", 1.2f);
+            off = ax * sp;
+        }
+        if (!array_mesh(*mesh, count, off)) {
+            if (mutates) doc.undo_once();
+            return fail("array failed");
+        }
+        s.face_sel.clear();
+        s.edge_sel.clear();
+        s.vert_sel.clear();
+        s.edit_mode = EditMode::Object;
+        return ok("array x" + std::to_string(count));
+    }
+
+    if (kind == "spin") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("spin: no mesh");
+        int steps = 8;
+        if (op.contains("steps") && op["steps"].is_number()) steps = std::max(2, int(op["steps"].get<float>()));
+        if (op.contains("count") && op["count"].is_number()) steps = std::max(2, int(op["count"].get<float>()));
+        float ang = require_f(op, "angle", 360.0f);
+        Vec3 ax{0, 1, 0};
+        parse_axis(require_str(op, "axis", "y"), ax);
+        Vec3 center = require_vec3(op, "center", {0, 0, 0});
+        std::vector<Edge> profile = s.edge_sel;
+        if (!spin_mesh(*mesh, profile, steps, ang, ax, center)) {
+            if (mutates) doc.undo_once();
+            return fail("spin failed");
+        }
+        s.face_sel.clear();
+        s.edge_sel.clear();
+        s.vert_sel.clear();
+        s.edit_mode = EditMode::Object;
+        return ok("spun x" + std::to_string(steps));
+    }
+
+    if (kind == "bridge") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("bridge: no mesh");
+        std::vector<int> neu;
+        if (!bridge_loops(*mesh, s.face_sel, s.edge_sel, neu)) {
+            if (mutates) doc.undo_once();
+            return fail("bridge: need two loops");
+        }
+        s.edit_mode = EditMode::Face;
+        s.face_sel = neu;
+        s.edge_sel.clear();
+        s.vert_sel.clear();
+        return ok("bridged " + std::to_string(neu.size()) + " faces");
+    }
+
+    if (kind == "join") {
+        int b = -1;
+        if (op.contains("other") && op["other"].is_string()) b = s.find_node(op["other"].get<std::string>());
+        else if (op.contains("with") && op["with"].is_string()) b = s.find_node(op["with"].get<std::string>());
+        int a = -1;
+        if (op.contains("target") && op["target"].is_string()) a = s.find_node(op["target"].get<std::string>());
+        if (a < 0 && s.selection >= 0 && s.selection != b) a = s.selection;
+        if (a < 0) {
+            for (int i = 0; i < int(s.nodes.size()); ++i) {
+                if (i != b && s.nodes[i].type == NodeType::Mesh && s.nodes[i].mesh >= 0) {
+                    a = i;
+                    break;
+                }
+            }
+        }
+        if (a < 0 || b < 0) return fail("join: need two meshes");
+        if (a == b) return fail("join: same object");
+        if (s.nodes[a].type != NodeType::Mesh || s.nodes[b].type != NodeType::Mesh)
+            return fail("join: not meshes");
+        if (s.nodes[a].mesh < 0 || s.nodes[b].mesh < 0) return fail("join: missing mesh");
+        std::string an = s.nodes[a].name;
+        std::string bn = s.nodes[b].name;
+        int users = 0;
+        for (const auto& n : s.nodes)
+            if (n.mesh == s.nodes[a].mesh) ++users;
+        if (users > 1) {
+            s.meshes.push_back(s.meshes[s.nodes[a].mesh]);
+            s.nodes[a].mesh = int(s.meshes.size()) - 1;
+        }
+        Mat4 xa = s.world_matrix(a);
+        Mat4 xb = s.world_matrix(b);
+        Mat4 xform = mul(invert_affine(xa), xb);
+        mesh_append_transformed(s.meshes[s.nodes[a].mesh], s.meshes[s.nodes[b].mesh], xform);
+        mesh_sync_render(s.meshes[s.nodes[a].mesh]);
+        s.remove_node_at(b);
+        s.selection = s.find_node(an);
+        s.edit_mode = EditMode::Object;
+        s.face_sel.clear();
+        s.edge_sel.clear();
+        s.vert_sel.clear();
+        return ok("joined " + bn + " into " + an);
+    }
+
+    if (kind == "ground" || kind == "to_ground") {
+        int i = resolve_node(s, op);
+        if (i < 0) i = s.selection;
+        if (i < 0) return fail("ground: no target");
+        Node& n = s.nodes[i];
+        if (n.type != NodeType::Mesh || n.mesh < 0) return fail("ground: not a mesh");
+        Mesh& mesh = s.meshes[n.mesh];
+        Mat4 W = s.world_matrix(i);
+        float ymin = 1e9f;
+        for (const auto& p : mesh.positions) ymin = std::min(ymin, transform_point(W, p).y);
+        if (ymin > 1e8f) return fail("ground: empty");
+        n.translation.y -= ymin;
+        return ok("grounded " + n.name);
+    }
+
+    if (kind == "origin") {
+        int i = resolve_node(s, op);
+        if (i < 0) i = s.selection;
+        if (i < 0) return fail("origin: no target");
+        Node& n = s.nodes[i];
+        if (n.type != NodeType::Mesh || n.mesh < 0) return fail("origin: not a mesh");
+        Mesh& mesh = s.meshes[n.mesh];
+        Vec3 c = mesh_centroid(mesh);
+        for (auto& p : mesh.positions) p = p - c;
+        mesh_sync_render(mesh);
+        Vec3 world_c = transform_point(s.world_matrix(i), c);
+        if (n.parent >= 0) {
+            Mat4 invp = invert_affine(s.world_matrix(n.parent));
+            n.translation = transform_point(invp, world_c);
+        } else {
+            n.translation = world_c;
+        }
+        return ok("origin to geometry " + n.name);
+    }
+
+    if (kind == "rig") {
+        std::string k = require_str(op, "kind", require_str(op, "rig", "biped"));
+        int root = -1;
+        if (k == "quadruped" || k == "animal" || k == "dog" || k == "horse") root = rig_quadruped(s);
+        else if (k == "face" || k == "facial") root = rig_face(s);
+        else {
+            bool apose = require_str(op, "pose", "") == "apose" || require_str(op, "pose", "") == "a";
+            if (k == "apose") apose = true;
+            root = rig_biped(s, apose);
+        }
+        if (root < 0) {
+            if (mutates) doc.undo_once();
+            return fail("rig failed");
+        }
+        return ok(std::string("rigged ") + k + " at " + s.nodes[root].name);
+    }
+
+    if (kind == "bind") {
+        int i = resolve_node(s, op);
+        if (i < 0) i = s.selection;
+        if (i < 0 || s.nodes[i].type != NodeType::Mesh) {
+            i = -1;
+            for (int k = 0; k < int(s.nodes.size()); ++k)
+                if (s.nodes[k].type == NodeType::Mesh && s.nodes[k].mesh >= 0) {
+                    i = k;
+                    break;
+                }
+        }
+        if (i < 0) return fail("bind: no mesh");
+        if (!bind_mesh(s, i)) {
+            if (mutates) doc.undo_once();
+            return fail("bind: need a mesh and bones");
+        }
+        return ok("bound skin");
+    }
+
+    if (kind == "pose") {
+        int i = resolve_node(s, op);
+        if (i < 0) i = s.selection;
+        if (i < 0 || s.nodes[i].type != NodeType::Bone) return fail("pose: pick a bone");
+        if (op.contains("rotation")) s.nodes[i].pose_rot = require_vec3(op, "rotation", s.nodes[i].pose_rot);
+        if (op.contains("delta")) s.nodes[i].pose_rot += require_vec3(op, "delta");
+        if (op.contains("translation")) s.nodes[i].pose_loc = require_vec3(op, "translation", s.nodes[i].pose_loc);
+        return ok("posed " + s.nodes[i].name);
+    }
+
+    if (kind == "rest") {
+        for (auto& n : s.nodes) {
+            if (n.type != NodeType::Bone) continue;
+            n.pose_rot = {0, 0, 0};
+            n.pose_loc = {0, 0, 0};
+        }
+        return ok("rest pose");
+    }
+
+    if (kind == "shape") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) {
+            for (auto& n : s.nodes)
+                if (n.type == NodeType::Mesh && n.mesh >= 0) {
+                    mesh = &s.meshes[n.mesh];
+                    break;
+                }
+        }
+        if (!mesh) return fail("shape: no mesh");
+        std::string name = require_str(op, "name", require_str(op, "shape"));
+        float v = require_f(op, "value", require_f(op, "amount", 1.0f));
+        bool found = false;
+        for (auto& sh : mesh->shapes) {
+            if (name.empty() || sh.name == name) {
+                sh.value = v;
+                found = true;
+                if (!name.empty()) break;
+            }
+        }
+        if (!found) return fail("shape: no key '" + name + "'");
+        return ok("shape " + name + " = " + std::to_string(v));
+    }
+
+    if (kind == "lod") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("lod: no mesh");
+        int levels = 3;
+        if (op.contains("levels") && op["levels"].is_number()) levels = std::max(1, int(op["levels"].get<float>()));
+        if (op.contains("level") && op["level"].is_number()) {
+            mesh->lod = std::max(0, int(op["level"].get<float>()));
+            if (mesh->lod > int(mesh->lods.size())) mesh->lod = int(mesh->lods.size());
+            return ok("lod " + std::to_string(mesh->lod));
+        }
+        if (!build_lods(*mesh, levels)) {
+            if (mutates) doc.undo_once();
+            return fail("lod failed");
+        }
+        mesh->lod = 0;
+        return ok("built " + std::to_string(mesh->lods.size()) + " lods");
+    }
+
+    if (kind == "describe") {
+        return ok(describe_scene(s).dump(2));
+    }
+
+    if (kind == "triangulate") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("triangulate: no mesh");
+        if (!triangulate_faces(*mesh, s.face_sel)) {
+            if (mutates) doc.undo_once();
+            return fail("triangulate failed");
+        }
+        return ok("triangulated " + std::to_string(mesh->faces.size()) + " faces");
+    }
+
+    if (kind == "poke") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("poke: no mesh");
+        std::vector<int> neu;
+        if (!poke_faces(*mesh, s.face_sel, neu)) {
+            if (mutates) doc.undo_once();
+            return fail("poke failed");
+        }
+        s.edit_mode = EditMode::Face;
+        s.face_sel = neu;
+        return ok("poked " + std::to_string(neu.size()) + " faces");
+    }
+
+    if (kind == "flip" || kind == "flip_normals") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("flip: no mesh");
+        if (!flip_faces(*mesh, s.face_sel)) {
+            if (mutates) doc.undo_once();
+            return fail("flip failed");
+        }
+        return ok("flipped faces");
+    }
+
+    if (kind == "dissolve") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("dissolve: no mesh");
+        std::vector<int> neu;
+        if (!dissolve_faces(*mesh, s.face_sel, neu)) {
+            if (mutates) doc.undo_once();
+            return fail("dissolve: select faces");
+        }
+        s.face_sel = neu;
+        s.edit_mode = EditMode::Face;
+        return ok("dissolved to " + std::to_string(neu.size()) + " faces");
+    }
+
+    if (kind == "duplicate_faces") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("duplicate_faces: no mesh");
+        std::vector<int> faces = s.face_sel;
+        if (faces.empty() && op.contains("region") && op["region"].is_string())
+            faces = faces_matching(*mesh, op["region"].get<std::string>());
+        float amt = require_f(op, "amount", 0.0f);
+        std::vector<int> neu;
+        if (!duplicate_faces_mesh(*mesh, faces, amt, neu)) {
+            if (mutates) doc.undo_once();
+            return fail("duplicate_faces: select faces");
+        }
+        s.edit_mode = EditMode::Face;
+        s.face_sel = neu;
+        return ok("duplicated " + std::to_string(neu.size()) + " faces");
+    }
+
+    if (kind == "separate") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("separate: no mesh");
+        int ni = s.selection;
+        std::vector<int> faces = s.face_sel;
+        if (faces.empty()) return fail("separate: select faces");
+        Mesh part;
+        part.name = mesh->name + "_sep";
+        std::set<uint32_t> used;
+        for (int fi : faces)
+            if (fi >= 0 && fi < int(mesh->faces.size()))
+                for (uint32_t v : mesh->faces[fi].v) used.insert(v);
+        std::map<uint32_t, uint32_t> remap;
+        for (uint32_t v : used) {
+            remap[v] = uint32_t(part.positions.size());
+            part.positions.push_back(mesh->positions[v]);
+        }
+        for (int fi : faces) {
+            if (fi < 0 || fi >= int(mesh->faces.size())) continue;
+            Face nf;
+            for (uint32_t v : mesh->faces[fi].v) nf.v.push_back(remap[v]);
+            part.faces.push_back(std::move(nf));
+        }
+        mesh_sync_render(part);
+        delete_faces_mesh(*mesh, faces);
+        s.meshes.push_back(std::move(part));
+        Node n = s.nodes[ni];
+        n.id = 0;
+        n.name = s.unique_name(n.name + "_sep");
+        n.mesh = int(s.meshes.size()) - 1;
+        n.translation.x += 1.2f;
+        int pi = s.add_node(std::move(n));
+        s.selection = pi;
+        s.face_sel.clear();
+        s.edit_mode = EditMode::Object;
+        return ok("separated " + s.nodes[pi].name);
+    }
+
+    if (kind == "weld" || kind == "weld_distance") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("weld: no mesh");
+        float d = require_f(op, "distance", require_f(op, "amount", 0.001f));
+        if (!weld_distance(*mesh, d)) {
+            if (mutates) doc.undo_once();
+            return fail("weld: nothing in range");
+        }
+        s.vert_sel.clear();
+        return ok("welded to " + std::to_string(mesh->positions.size()) + " verts");
+    }
+
+    if (kind == "smooth") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("smooth: no mesh");
+        auto vs = current_verts(s, *mesh);
+        float f = require_f(op, "factor", require_f(op, "amount", 0.5f));
+        int it = 1;
+        if (op.contains("iters") && op["iters"].is_number()) it = std::max(1, int(op["iters"].get<float>()));
+        if (!smooth_verts(*mesh, vs, f, it)) {
+            if (mutates) doc.undo_once();
+            return fail("smooth failed");
+        }
+        return ok("smoothed " + std::to_string(vs.size()) + " verts");
+    }
+
+    if (kind == "push") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("push: no mesh");
+        auto vs = current_verts(s, *mesh);
+        float a = require_f(op, "amount", 0.1f);
+        if (!push_verts(*mesh, vs, a)) {
+            if (mutates) doc.undo_once();
+            return fail("push failed");
+        }
+        return ok("pushed " + std::to_string(vs.size()) + " verts");
+    }
+
+    if (kind == "sphere" || kind == "to_sphere") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("sphere: no mesh");
+        auto vs = current_verts(s, *mesh);
+        float f = require_f(op, "factor", require_f(op, "amount", 1.0f));
+        if (!to_sphere(*mesh, vs, f)) {
+            if (mutates) doc.undo_once();
+            return fail("sphere failed");
+        }
+        return ok("to sphere");
+    }
+
+    if (kind == "flatten") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("flatten: no mesh");
+        auto vs = current_verts(s, *mesh);
+        Vec3 ax{0, 1, 0};
+        parse_axis(require_str(op, "axis", "y"), ax);
+        if (!flatten_verts(*mesh, vs, ax)) {
+            if (mutates) doc.undo_once();
+            return fail("flatten failed");
+        }
+        return ok("flattened");
+    }
+
+    if (kind == "randomize") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("randomize: no mesh");
+        auto vs = current_verts(s, *mesh);
+        float a = require_f(op, "amount", 0.05f);
+        if (!randomize_verts(*mesh, vs, a)) {
+            if (mutates) doc.undo_once();
+            return fail("randomize failed");
+        }
+        return ok("randomized");
+    }
+
+    if (kind == "apply") {
+        int i = resolve_node(s, op);
+        if (i < 0) i = s.selection;
+        if (i < 0) return fail("apply: no target");
+        Node& n = s.nodes[i];
+        if (n.type != NodeType::Mesh || n.mesh < 0) return fail("apply: not a mesh");
+        Mesh& mesh = s.meshes[n.mesh];
+        Mat4 R = euler_xyz(n.rotation_deg);
+        Mat4 S = scale(n.scale);
+        Mat4 X = mul(R, S);
+        for (auto& p : mesh.positions) p = transform_point(X, p);
+        mesh_sync_render(mesh);
+        n.rotation_deg = {0, 0, 0};
+        n.scale = {1, 1, 1};
+        return ok("applied transform " + n.name);
+    }
+
+    if (kind == "bisect") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("bisect: no mesh");
+        Vec3 ax{0, 1, 0};
+        parse_axis(require_str(op, "axis", "y"), ax);
+        float d = require_f(op, "distance", require_f(op, "offset", 0.0f));
+        if (!bisect_mesh(*mesh, ax, d)) {
+            if (mutates) doc.undo_once();
+            return fail("bisect failed");
+        }
+        s.face_sel.clear();
+        return ok("bisected " + std::to_string(mesh->faces.size()) + " faces");
+    }
+
+    if (kind == "snap") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("snap: no mesh");
+        auto vs = current_verts(s, *mesh);
+        float g = require_f(op, "grid", require_f(op, "amount", 0.1f));
+        if (!snap_verts(*mesh, vs, g)) {
+            if (mutates) doc.undo_once();
+            return fail("snap failed");
+        }
+        return ok("snapped");
+    }
+
+    if (kind == "split") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("split: no mesh");
+        if (s.face_sel.empty()) return fail("split: select faces");
+        if (!split_region(*mesh, s.face_sel)) {
+            if (mutates) doc.undo_once();
+            return fail("split failed");
+        }
+        return ok("split region");
+    }
+
+    if (kind == "connect") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("connect: no mesh");
+        if (s.vert_sel.size() < 2) return fail("connect: select 2 verts");
+        if (!connect_verts(*mesh, s.vert_sel[0], s.vert_sel[1])) {
+            if (mutates) doc.undo_once();
+            return fail("connect: verts not on a face");
+        }
+        return ok("connected verts");
+    }
+
+    if (kind == "grow" || kind == "select_more") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("grow: no mesh");
+        if (s.edit_mode == EditMode::Face || !s.face_sel.empty()) {
+            s.face_sel = grow_faces(*mesh, s.face_sel);
+            s.edit_mode = EditMode::Face;
+            return ok("grew to " + std::to_string(s.face_sel.size()) + " faces");
+        }
+        if (s.edit_mode == EditMode::Edge || !s.edge_sel.empty()) {
+            s.edge_sel = grow_edges(*mesh, s.edge_sel);
+            s.edit_mode = EditMode::Edge;
+            return ok("grew to " + std::to_string(s.edge_sel.size()) + " edges");
+        }
+        s.vert_sel = grow_verts(*mesh, s.vert_sel);
+        s.edit_mode = EditMode::Vert;
+        return ok("grew to " + std::to_string(s.vert_sel.size()) + " verts");
+    }
+
+    if (kind == "invert") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("invert: no mesh");
+        if (s.edit_mode == EditMode::Face || !s.face_sel.empty()) {
+            std::set<int> cur(s.face_sel.begin(), s.face_sel.end());
+            s.face_sel.clear();
+            for (int i = 0; i < int(mesh->faces.size()); ++i)
+                if (!cur.count(i)) s.face_sel.push_back(i);
+            s.edit_mode = EditMode::Face;
+            return ok("inverted " + std::to_string(s.face_sel.size()) + " faces");
+        }
+        if (s.edit_mode == EditMode::Vert || !s.vert_sel.empty()) {
+            std::set<uint32_t> cur(s.vert_sel.begin(), s.vert_sel.end());
+            s.vert_sel.clear();
+            for (uint32_t i = 0; i < mesh->positions.size(); ++i)
+                if (!cur.count(i)) s.vert_sel.push_back(i);
+            s.edit_mode = EditMode::Vert;
+            return ok("inverted " + std::to_string(s.vert_sel.size()) + " verts");
+        }
+        return fail("invert: nothing selected");
+    }
+
+    if (kind == "linked") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("linked: no mesh");
+        s.face_sel = linked_faces(*mesh, s.face_sel);
+        s.edit_mode = EditMode::Face;
+        return ok("linked " + std::to_string(s.face_sel.size()) + " faces");
+    }
+
+    if (kind == "move" || kind == "set_translation") {
+        int i = resolve_node(s, op);
+        if (i < 0) return fail("move: no target");
+        s.nodes[i].translation = require_vec3(op, "translation", s.nodes[i].translation);
+        return ok("moved " + s.nodes[i].name);
+    }
+
+    if (kind == "translate") {
+        Vec3 d = require_vec3(op, "delta");
+        Mesh* mesh = s.selected_mesh();
+        if (mesh && s.edit_mode != EditMode::Object) {
+            std::vector<uint32_t> vs = s.vert_sel;
+            if (vs.empty() && s.edit_mode == EditMode::Face) vs = verts_of_faces(*mesh, s.face_sel);
+            if (vs.empty() && s.edit_mode == EditMode::Edge) {
+                std::set<uint32_t> u;
+                for (Edge e : s.edge_sel) {
+                    u.insert(e.a);
+                    u.insert(e.b);
+                }
+                vs.assign(u.begin(), u.end());
+            }
+            if (!vs.empty() && translate_verts(*mesh, vs, d))
+                return ok("translated " + std::to_string(vs.size()) + " verts");
+        }
+        int i = resolve_node(s, op);
+        if (i < 0) return fail("translate: no target");
+        s.nodes[i].translation += d;
+        return ok("translated " + s.nodes[i].name);
+    }
+
+    if (kind == "rotate" || kind == "set_rotation") {
+        int i = resolve_node(s, op);
+        if (i < 0) return fail("rotate: no target");
+        if (op.contains("delta")) s.nodes[i].rotation_deg += require_vec3(op, "delta");
+        else s.nodes[i].rotation_deg = require_vec3(op, "rotation", s.nodes[i].rotation_deg);
+        return ok("rotated " + s.nodes[i].name);
+    }
+
+    if (kind == "scale" || kind == "set_scale") {
+        int i = resolve_node(s, op);
+        if (i < 0) return fail("scale: no target");
+        s.nodes[i].scale = require_vec3(op, "scale", s.nodes[i].scale);
+        return ok("scaled " + s.nodes[i].name);
+    }
+
+    if (kind == "color" || kind == "set_material") {
+        int i = resolve_node(s, op);
+        if (i < 0) return fail("material: no target");
+        Node& n = s.nodes[i];
+        if (n.material < 0) {
+            n.material = add_material(s, {0.72f, 0.73f, 0.76f});
+        }
+        Material& m = s.materials[n.material];
+        if (op.contains("albedo")) m.albedo = require_vec3(op, "albedo", m.albedo);
+        if (op.contains("roughness")) m.roughness = require_f(op, "roughness", m.roughness);
+        if (op.contains("metallic")) m.metallic = require_f(op, "metallic", m.metallic);
+        if (op.contains("emission")) m.emission = require_f(op, "emission", m.emission);
+        return ok("material " + n.name);
+    }
+
+    if (kind == "parent") {
+        int i = resolve_node(s, op);
+        if (i < 0) return fail("parent: no child");
+        std::string p = require_str(op, "parent");
+        if (p.empty() || p == "none") {
+            s.nodes[i].parent = -1;
+            return ok("unparented " + s.nodes[i].name);
+        }
+        int pi = s.find_node(p);
+        if (pi < 0) return fail("parent not found");
+        if (pi == i) return fail("cannot parent to self");
+        s.nodes[i].parent = pi;
+        return ok(s.nodes[i].name + " parented to " + s.nodes[pi].name);
+    }
+
+    if (kind == "lookat") {
+        int i = resolve_node(s, op);
+        if (i < 0 || s.nodes[i].type != NodeType::Camera) {
+            i = ensure_default_camera(s);
+        }
+        Vec3 eye = require_vec3(op, "eye", s.nodes[i].translation);
+        Vec3 center = require_vec3(op, "center", {0, 0, 0});
+        s.nodes[i].type = NodeType::Camera;
+        s.nodes[i].translation = eye;
+        s.nodes[i].rotation_deg = camera_euler_from_forward(center - eye);
+        s.active_camera = i;
+        return ok("camera " + s.nodes[i].name + " aimed");
+    }
+
+    // frame: like lookat, but you name what to look at instead of doing the
+    // arithmetic yourself. target=<name> | all | scene.
+    if (kind == "frame" || kind == "focus") {
+        int i = resolve_node(s, op);
+        if (i < 0 || s.nodes[i].type != NodeType::Camera) i = ensure_default_camera(s);
+        Vec3 lo{1e9f, 1e9f, 1e9f}, hi{-1e9f, -1e9f, -1e9f};
+        bool any = false;
+        auto add = [&](Vec3 p) {
+            lo.x = std::min(lo.x, p.x); lo.y = std::min(lo.y, p.y); lo.z = std::min(lo.z, p.z);
+            hi.x = std::max(hi.x, p.x); hi.y = std::max(hi.y, p.y); hi.z = std::max(hi.z, p.z);
+            any = true;
+        };
+        std::string tgt = require_str(op, "target", "");
+        int only = tgt.empty() ? -1 : s.find_node(tgt);
+        if (!tgt.empty() && only < 0) return fail("frame: no node '" + tgt + "'");
+        for (int ni = 0; ni < int(s.nodes.size()); ++ni) {
+            if (ni == i || s.nodes[ni].type != NodeType::Mesh) continue;
+            if (only >= 0 && ni != only) continue;
+            const Node& nd = s.nodes[ni];
+            Mat4 W = s.world_matrix(ni);
+            // Use the real mesh bounds, not just the pivot: a single object framed
+            // by its pivot alone would put the camera inside the object.
+            if (nd.mesh >= 0 && nd.mesh < int(s.meshes.size()) && !s.meshes[nd.mesh].positions.empty()) {
+                const Mesh& mesh = s.meshes[nd.mesh];
+                int lod = mesh.lod;
+                if (lod > 0 && lod <= int(mesh.lods.size())) {
+                    for (Vec3 p : mesh.lods[lod - 1].positions) add(transform_point(W, p));
+                } else {
+                    for (Vec3 p : mesh.positions) add(transform_point(W, p));
+                }
+            } else {
+                add(nd.translation);
+            }
+        }
+        if (!any) return fail("frame: nothing to frame");
+        Vec3 center = (lo + hi) * 0.5f;
+        float radius = std::max(0.25f, length(hi - center));
+        float fov = s.nodes[i].fov_deg > 1.0f ? s.nodes[i].fov_deg : 50.0f;
+        float margin = require_f(op, "margin", 1.35f);
+        if (!finite(margin) || margin < 1.0f) margin = 1.35f;
+        float dist = radius / std::tan(deg2rad(fov) * 0.5f) * margin;
+        std::string ax = require_str(op, "axis", "iso");
+        Vec3 dir = ax == "front" ? Vec3{0, 0, 1}
+                 : ax == "side"  ? Vec3{1, 0, 0}
+                 : ax == "top"   ? Vec3{0, 1, 0.001f}
+                                 : normalize(Vec3{0.78f, 0.52f, 1.0f});
+        Vec3 eye = center + normalize(dir) * dist;
+        s.nodes[i].translation = eye;
+        s.nodes[i].rotation_deg = camera_euler_from_forward(center - eye);
+        s.active_camera = i;
+        return ok("framed " + (only >= 0 ? s.nodes[only].name : std::string("scene")));
+    }
+
+    if (kind == "set_camera") {
+        int i = resolve_node(s, op);
+        if (i < 0) return fail("camera not found");
+        s.active_camera = i;
+        if (op.contains("fov")) s.nodes[i].fov_deg = require_f(op, "fov", 50);
+        return ok("active camera " + s.nodes[i].name);
+    }
+
+    if (mutates) {
+        doc.undo.pop_back();
+    }
+    return fail("unknown op '" + kind + "'");
+}
+
+OpResult apply_ops(Document& doc, const nlohmann::json& ops) {
+    if (ops.is_object()) return apply_op(doc, ops);
+    if (!ops.is_array()) return fail("ops must be object or array");
+    std::ostringstream msg;
+    bool any = false;
+    for (const auto& op : ops) {
+        OpResult r = apply_op(doc, op);
+        if (!r.ok) return r;
+        if (any) msg << "; ";
+        msg << r.message;
+        any = true;
+    }
+    if (!any) return ok("no ops");
+    return ok(msg.str());
+}
+
+}  // namespace kiln
