@@ -233,4 +233,78 @@ inline Mat4 perspective(float fov_deg, float aspect, float zn, float zf) {
     return m;
 }
 
+inline Mat4 quat_to_mat(float qx, float qy, float qz, float qw) {
+    float n = std::sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
+    if (n > 1e-12f) {
+        qx /= n; qy /= n; qz /= n; qw /= n;
+    } else {
+        qx = qy = qz = 0;
+        qw = 1;
+    }
+    Mat4 m = Mat4::identity();
+    m.at(0, 0) = 1.0f - 2.0f * (qy * qy + qz * qz);
+    m.at(0, 1) = 2.0f * (qx * qy - qz * qw);
+    m.at(0, 2) = 2.0f * (qx * qz + qy * qw);
+    m.at(1, 0) = 2.0f * (qx * qy + qz * qw);
+    m.at(1, 1) = 1.0f - 2.0f * (qx * qx + qz * qz);
+    m.at(1, 2) = 2.0f * (qy * qz - qx * qw);
+    m.at(2, 0) = 2.0f * (qx * qz - qy * qw);
+    m.at(2, 1) = 2.0f * (qy * qz + qx * qw);
+    m.at(2, 2) = 1.0f - 2.0f * (qx * qx + qy * qy);
+    return m;
+}
+
+// Inverse of euler_xyz: XYZ degrees in, XYZ degrees out, for a rotation-only
+// matrix built as Rz * Ry * Rx. The sin(pi/2) branch is the gimbal-lock case.
+inline Vec3 mat_to_euler_xyz(const Mat4& m) {
+    float cy = std::sqrt(m.at(0, 0) * m.at(0, 0) + m.at(1, 0) * m.at(1, 0));
+    float ax, ay, az;
+    if (cy > 1e-6f) {
+        ax = std::atan2(m.at(2, 1), m.at(1, 1));
+        ay = std::atan2(-m.at(2, 0), cy);
+        az = std::atan2(m.at(1, 0), m.at(0, 0));
+    } else {
+        ax = std::atan2(-m.at(1, 2), m.at(2, 2));
+        ay = std::atan2(-m.at(2, 0), cy);
+        az = 0.0f;
+    }
+    return {rad2deg(ax), rad2deg(ay), rad2deg(az)};
+}
+
+inline Mat4 mat_rotation_part(const Mat4& m) {
+    Mat4 r = Mat4::identity();
+    for (int c = 0; c < 3; ++c)
+        for (int row = 0; row < 3; ++row) r.at(row, c) = m.at(row, c);
+    return r;
+}
+
+inline Vec3 mat_column(const Mat4& m, int c) {
+    return {m.at(0, c), m.at(1, c), m.at(2, c)};
+}
+
+// Orthonormal basis whose X axis is `x`, keeping as much of `up` as possible so
+// the result differs from `x` by the smallest rotation.
+inline Mat4 basis_from_x(Vec3 x, Vec3 up) {
+    x = normalize(x);
+    if (length(x) < 0.5f) return Mat4::identity();
+    Vec3 y = up - x * dot(up, x);
+    if (length(y) < 1e-6f) {
+        Vec3 alt{0, 0, 1};
+        if (std::abs(dot(x, alt)) > 0.9f) alt = Vec3{0, 1, 0};
+        y = alt - x * dot(alt, x);
+    }
+    y = normalize(y);
+    Vec3 z = cross(x, y);
+    const float xs[3] = {x.x, x.y, x.z};
+    const float ys[3] = {y.x, y.y, y.z};
+    const float zs[3] = {z.x, z.y, z.z};
+    Mat4 m = Mat4::identity();
+    for (int i = 0; i < 3; ++i) {
+        m.at(i, 0) = xs[i];
+        m.at(i, 1) = ys[i];
+        m.at(i, 2) = zs[i];
+    }
+    return m;
+}
+
 }  // namespace kiln

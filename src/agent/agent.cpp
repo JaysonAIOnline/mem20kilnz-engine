@@ -205,6 +205,124 @@ bool dsl_command(const std::string& line, nlohmann::json& ops) {
         ops = nlohmann::json::array({{{"op", "export_obj"}, {"path", t[1]}}});
         return true;
     }
+    if (c == "subsurf" || c == "subdivide_surface" || c == "catmull_clark") {
+        nlohmann::json op = {{"op", "subsurf"}};
+        for (size_t i = 1; i < t.size(); ++i) {
+            std::string k = lower_copy(t[i]);
+            if ((k == "levels" || k == "level") && i + 1 < t.size())
+                op["levels"] = int(to_f(t[++i]));
+            else if (is_number(t[i])) op["levels"] = int(to_f(t[i]));
+        }
+        ops = nlohmann::json::array({op});
+        return true;
+    }
+    if (c == "wireframe") {
+        nlohmann::json op = {{"op", "wireframe"}};
+        for (size_t i = 1; i < t.size(); ++i) {
+            std::string k = lower_copy(t[i]);
+            if ((k == "thickness" || k == "amount") && i + 1 < t.size())
+                op["thickness"] = to_f(t[++i]);
+            else if (is_number(t[i])) op["thickness"] = to_f(t[i]);
+        }
+        ops = nlohmann::json::array({op});
+        return true;
+    }
+    if (c == "shrinkwrap") {
+        if (t.size() < 2) return false;
+        nlohmann::json op = {{"op", "shrinkwrap"}, {"target", t[1]}};
+        for (size_t i = 2; i < t.size(); ++i) {
+            std::string k = lower_copy(t[i]);
+            if ((k == "weight" || k == "amount") && i + 1 < t.size())
+                op["weight"] = to_f(t[++i]);
+            else if (is_number(t[i])) op["weight"] = to_f(t[i]);
+        }
+        ops = nlohmann::json::array({op});
+        return true;
+    }
+    if (c == "symmetrize" || c == "mirror_symmetry") {
+        std::string ax = "x";
+        for (size_t i = 1; i < t.size(); ++i) {
+            std::string k = lower_copy(t[i]);
+            if (k == "axis" && i + 1 < t.size()) {
+                ax = lower_copy(t[++i]);
+                break;
+            }
+            if (k == "x" || k == "y" || k == "z") {
+                ax = k;
+                break;
+            }
+        }
+        if (ax != "x" && ax != "y" && ax != "z") return false;
+        ops = nlohmann::json::array({{{"op", "symmetrize"}, {"axis", ax}}});
+        return true;
+    }
+    if (c == "boundary") {
+        ops = nlohmann::json::array({{{"op", "boundary"}}});
+        return true;
+    }
+    if (c == "extrude_individual") {
+        nlohmann::json op = {{"op", "extrude_individual"}};
+        for (size_t i = 1; i < t.size(); ++i) {
+            std::string k = lower_copy(t[i]);
+            if ((k == "amount" || k == "distance") && i + 1 < t.size())
+                op["amount"] = to_f(t[++i]);
+            else if (is_number(t[i])) op["amount"] = to_f(t[i]);
+        }
+        ops = nlohmann::json::array({op});
+        return true;
+    }
+    if (c == "rotate_verts" || c == "scale_verts") {
+        std::vector<float> vals;
+        for (size_t i = 1; i < t.size(); ++i)
+            if (is_number(t[i])) vals.push_back(to_f(t[i]));
+        if (vals.empty()) return false;
+        float a = vals[0];
+        float b = vals.size() > 1 ? vals[1] : vals[0];
+        float g = vals.size() > 2 ? vals[2] : vals[0];
+        nlohmann::json op = {{"op", c}};
+        if (c == "scale_verts") op["scale"] = nlohmann::json::array({a, b, g});
+        else op["rotation"] = nlohmann::json::array({a, b, g});
+        ops = nlohmann::json::array({op});
+        return true;
+    }
+    if (c == "shear_verts") {
+        if (t.size() < 3) return false;
+        std::string ax = lower_copy(t[1]);
+        if (ax != "x" && ax != "y" && ax != "z") return false;
+        nlohmann::json op = {{"op", "shear_verts"}, {"axis", ax}};
+        for (size_t i = 2; i < t.size(); ++i) {
+            std::string k = lower_copy(t[i]);
+            if ((k == "factor" || k == "amount") && i + 1 < t.size())
+                op["factor"] = to_f(t[++i]);
+            else if (is_number(t[i])) op["factor"] = to_f(t[i]);
+        }
+        ops = nlohmann::json::array({op});
+        return true;
+    }
+    if (c == "frame_at" || c == "set_frame") {
+        nlohmann::json op = {{"op", "frame_at"}};
+        for (size_t i = 1; i < t.size(); ++i) {
+            std::string k = lower_copy(t[i]);
+            if ((k == "frame" || k == "at") && i + 1 < t.size())
+                op["frame"] = int(to_f(t[++i]));
+            else if (is_number(t[i])) op["frame"] = int(to_f(t[i]));
+        }
+        ops = nlohmann::json::array({op});
+        return true;
+    }
+    if (c == "ik" || c == "ik_two_bone") {
+        if (t.size() < 2) return false;
+        nlohmann::json op = {{"op", "ik"}, {"target", t[1]}};
+        std::vector<float> vals;
+        for (size_t i = 2; i < t.size(); ++i)
+            if (is_number(t[i])) vals.push_back(to_f(t[i]));
+        if (vals.size() >= 3)
+            op["at"] = nlohmann::json::array({vals[0], vals[1], vals[2]});
+        else
+            return false;
+        ops = nlohmann::json::array({op});
+        return true;
+    }
     if (c == "decimate") {
         nlohmann::json op = {{"op", "decimate"}};
         for (size_t i = 1; i < t.size(); ++i) {

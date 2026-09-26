@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <queue>
 #include <set>
@@ -331,6 +332,406 @@ bool decimate_mesh(Mesh& m, float ratio) {
     m.shapes.clear();
     m.lods.clear();
     m.lod = 0;
+    mesh_sync_render(m);
+    return true;
+}
+
+
+std::vector<int> boundary_faces(const Mesh& m) {
+    std::map<uint64_t, int> use;
+    auto ekey = [](uint32_t a, uint32_t b) -> uint64_t {
+        uint32_t lo = a < b ? a : b, hi = a < b ? b : a;
+        return (static_cast<uint64_t>(lo) << 32) | hi;
+    };
+    for (const Face& f : m.faces) {
+        size_t nv = f.v.size();
+        for (size_t i = 0; i < nv; ++i) use[ekey(f.v[i], f.v[(i + 1) % nv])] += 1;
+    }
+    std::set<uint64_t> open;
+    for (const auto& kv : use)
+        if (kv.second == 1) open.insert(kv.first);
+    std::vector<int> out;
+    for (size_t fi = 0; fi < m.faces.size(); ++fi) {
+        const Face& f = m.faces[fi];
+        size_t nv = f.v.size();
+        for (size_t i = 0; i < nv; ++i)
+            if (open.count(ekey(f.v[i], f.v[(i + 1) % nv]))) {
+                out.push_back(static_cast<int>(fi));
+                break;
+            }
+    }
+    return out;
+}
+
+static Vec3 centroid_of(const Mesh& m, const std::vector<uint32_t>& verts) {
+    Vec3 c{0, 0, 0};
+    size_t k = 0;
+    for (uint32_t v : verts)
+        if (v < m.positions.size()) {
+            c += m.positions[v];
+            ++k;
+        }
+    return k ? c / float(k) : Vec3{0, 0, 0};
+}
+
+bool rotate_verts(Mesh& m, const std::vector<uint32_t>& verts, Vec3 euler_deg) {
+    if (verts.empty() || m.positions.empty()) return false;
+    Vec3 c = centroid_of(m, verts);
+    Mat4 r = euler_xyz(euler_deg);
+    bool any = false;
+    for (uint32_t v : verts)
+        if (v < m.positions.size()) {
+            m.positions[v] = c + transform_dir(r, m.positions[v] - c);
+            any = true;
+        }
+    if (!any) return false;
+    mesh_sync_render(m);
+    return true;
+}
+
+bool scale_verts(Mesh& m, const std::vector<uint32_t>& verts, Vec3 scl) {
+    if (verts.empty() || m.positions.empty()) return false;
+    if (std::abs(scl.x) < 1e-9f || std::abs(scl.y) < 1e-9f || std::abs(scl.z) < 1e-9f) return false;
+    Vec3 c = centroid_of(m, verts);
+    bool any = false;
+    for (uint32_t v : verts)
+        if (v < m.positions.size()) {
+            m.positions[v] = c + (m.positions[v] - c) * scl;
+            any = true;
+        }
+    if (!any) return false;
+    mesh_sync_render(m);
+    return true;
+}
+
+bool shear_verts(Mesh& m, const std::vector<uint32_t>& verts, Vec3 axis, float factor) {
+    if (verts.empty() || m.positions.empty() || factor == 0.0f) return false;
+    int a = -1;
+    if (axis.x != 0.0f) a = 0;
+    else if (axis.y != 0.0f) a = 1;
+    else if (axis.z != 0.0f) a = 2;
+    if (a < 0) return false;
+    int src = (a + 1) % 3;
+    float* comps[3] = {nullptr, nullptr, nullptr};
+    bool any = false;
+    for (uint32_t v : verts) {
+        if (v >= m.positions.size()) continue;
+        float val[3] = {m.positions[v].x, m.positions[v].y, m.positions[v].z};
+        val[a] += factor * val[src];
+        m.positions[v] = Vec3{val[0], val[1], val[2]};
+        any = true;
+    }
+    (void)comps;
+    if (!any) return false;
+    mesh_sync_render(m);
+    return true;
+}
+
+bool symmetrize_mesh(Mesh& m, int axis) {
+    if (axis < 0 || axis > 2) return false;
+    if (m.faces.empty() || m.positions.empty()) return false;
+    auto coord = [](const Vec3& p, int a) { return a == 0 ? p.x : (a == 1 ? p.y : p.z); };
+
+    const size_t n = m.positions.size();
+    std::vector<uint32_t> mirror(n, 0xFFFFFFFFu);
+    const float kEps = 1e-5f;
+    for (size_t i = 0; i < n; ++i) {
+        float c = coord(m.positions[i], axis);
+        if (c > kEps) {
+            Vec3 p = m.positions[i];
+            if (axis == 0) p.x = -c;
+            else if (axis == 1) p.y = -c;
+            else p.z = -c;
+            mirror[i] = static_cast<uint32_t>(m.positions.size());
+            m.positions.push_back(p);
+        } else if (std::abs(c) <= kEps) {
+            m.positions[i].x = std::abs(m.positions[i].x) < kEps ? 0.0f : m.positions[i].x;
+            m.positions[i].y = std::abs(m.positions[i].y) < kEps ? 0.0f : m.positions[i].y;
+            m.positions[i].z = std::abs(m.positions[i].z) < kEps ? 0.0f : m.positions[i].z;
+        }
+    }
+    size_t added = 0;
+    std::vector<Face> extra;
+    for (const Face& f : m.faces) {
+        bool positive = false, negative = false;
+        bool usable = true;
+        for (uint32_t v : f.v) {
+            if (v >= n || mirror[v] == 0xFFFFFFFFu) {
+                usable = false;
+                break;
+            }
+            (coord(m.positions[v], axis) > 0.0f ? positive : negative) = true;
+        }
+        if (!usable) continue;
+        if (!positive || !negative) {
+            Face g;
+            for (uint32_t v : f.v) g.v.push_back(mirror[v]);
+            std::reverse(g.v.begin(), g.v.end());
+            extra.push_back(std::move(g));
+            ++added;
+        }
+    }
+    if (added == 0) return false;
+    for (auto& f : extra) m.faces.push_back(std::move(f));
+    weld_distance(m, 1e-4f);
+    mesh_sync_render(m);
+    return true;
+}
+
+bool wireframe_mesh(Mesh& m, float thickness) {
+    if (m.faces.empty() || m.positions.empty()) return false;
+    if (!(thickness > 1e-6f)) return false;
+    const float half = thickness * 0.5f;
+    std::map<uint64_t, std::pair<uint32_t, uint32_t>> edges;
+    auto ekey = [](uint32_t a, uint32_t b) -> uint64_t {
+        uint32_t lo = a < b ? a : b, hi = a < b ? b : a;
+        return (static_cast<uint64_t>(lo) << 32) | hi;
+    };
+    for (const Face& f : m.faces) {
+        size_t nv = f.v.size();
+        for (size_t i = 0; i < nv; ++i) {
+            uint32_t a = f.v[i], b = f.v[(i + 1) % nv];
+            if (a >= m.positions.size() || b >= m.positions.size() || a == b) continue;
+            edges.emplace(ekey(a, b), std::make_pair(a, b));
+        }
+    }
+    if (edges.empty()) return false;
+
+    Mesh out;
+    out.name = m.name;
+    out.smooth = m.smooth;
+    for (const auto& kv : edges) {
+        Vec3 pa = m.positions[kv.second.first], pb = m.positions[kv.second.second];
+        Vec3 dir = pb - pa;
+        if (length(dir) < 1e-9f) continue;
+        dir = normalize(dir);
+        Vec3 ref{0, 0, 1};
+        if (std::abs(dot(dir, ref)) > 0.9f) ref = Vec3{0, 1, 0};
+        Vec3 side = normalize(cross(dir, ref));
+        Vec3 up = cross(side, dir);
+        uint32_t base = static_cast<uint32_t>(out.positions.size());
+        for (int e = 0; e < 2; ++e) {
+            Vec3 p = e == 0 ? pa : pb;
+            out.positions.push_back(p - side * half - up * half);
+            out.positions.push_back(p + side * half - up * half);
+            out.positions.push_back(p + side * half + up * half);
+            out.positions.push_back(p - side * half + up * half);
+        }
+        for (int s = 0; s < 4; ++s) {
+            int s2 = (s + 1) % 4;
+            out.faces.push_back(Face{{base + static_cast<uint32_t>(s),
+                                     base + static_cast<uint32_t>(s2),
+                                     base + 4 + static_cast<uint32_t>(s2),
+                                     base + 4 + static_cast<uint32_t>(s)}});
+        }
+        out.faces.push_back(Face{{base + 0, base + 1, base + 2, base + 3}});
+        out.faces.push_back(Face{{base + 7, base + 6, base + 5, base + 4}});
+    }
+    if (out.faces.empty()) return false;
+    mesh_sync_render(out);
+    m = std::move(out);
+    return true;
+}
+
+static Vec3 closest_on_triangle(const Vec3& p, const Vec3& a, const Vec3& b, const Vec3& c) {
+    Vec3 ab = b - a, ac = c - a, ap = p - a;
+    float d1 = dot(ab, ap), d2 = dot(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) return a;
+    Vec3 bp = p - b;
+    float d3 = dot(ab, bp), d4 = dot(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3) return b;
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
+        float v = d1 / (d1 - d3);
+        return a + ab * v;
+    }
+    Vec3 cp = p - c;
+    float d5 = dot(ab, cp), d6 = dot(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6) return c;
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
+        float w = d2 / (d2 - d6);
+        return a + ac * w;
+    }
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
+        float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return b + (c - b) * w;
+    }
+    float denom = 1.0f / (va + vb + vc);
+    float v = vb * denom, w = vc * denom;
+    return a + ab * v + ac * w;
+}
+
+bool shrinkwrap_mesh(Mesh& m, const Mesh& target, float weight) {
+    if (m.positions.empty() || target.faces.empty()) return false;
+    float w = clamp01(weight);
+    if (w <= 0.0f) return false;
+    std::vector<Vec3> tp;
+    for (const Face& f : target.faces)
+        for (uint32_t v : f.v)
+            if (v < target.positions.size()) tp.push_back(target.positions[v]);
+    if (tp.size() < 3) return false;
+
+    std::vector<Vec3> out = m.positions;
+    for (size_t i = 0; i < m.positions.size(); ++i) {
+        const Vec3& p = m.positions[i];
+        float best = std::numeric_limits<float>::max();
+        Vec3 cp{0, 0, 0};
+        for (const Face& f : target.faces) {
+            if (f.v.size() < 3) continue;
+            Vec3 a = target.positions[f.v[0]];
+            Vec3 b = target.positions[f.v[1 % f.v.size()]];
+            Vec3 c = target.positions[f.v[2 % f.v.size()]];
+            Vec3 q = closest_on_triangle(p, a, b, c);
+            float d = length(q - p);
+            if (d < best) {
+                best = d;
+                cp = q;
+            }
+        }
+        if (best < std::numeric_limits<float>::max())
+            out[i] = p + (cp - p) * w;
+    }
+    m.positions = std::move(out);
+    mesh_sync_render(m);
+    return true;
+}
+
+bool extrude_individual(Mesh& m, const std::vector<int>& faces, float amount,
+                        std::vector<int>& new_sel) {
+    mesh_ensure_faces(m);
+    new_sel.clear();
+    if (faces.empty() || m.faces.empty() || amount == 0.0f) return false;
+    int added = 0;
+    for (int fi : faces) {
+        if (fi < 0 || fi >= static_cast<int>(m.faces.size())) continue;
+        const Face orig = m.faces[static_cast<size_t>(fi)];
+        if (orig.v.size() < 3) continue;
+        Vec3 n = face_normal(m, fi);
+        if (length(n) < 0.5f) continue;
+        Vec3 delta = normalize(n) * amount;
+        uint32_t base = static_cast<uint32_t>(m.positions.size());
+        for (uint32_t v : orig.v) m.positions.push_back(m.positions[v] + delta);
+        Face cap;
+        cap.v.reserve(orig.v.size());
+        for (size_t i = 0; i < orig.v.size(); ++i)
+            cap.v.push_back(base + static_cast<uint32_t>(i));
+        m.faces.push_back(std::move(cap));
+        int cap_index = static_cast<int>(m.faces.size()) - 1;
+        new_sel.push_back(cap_index);
+        for (size_t i = 0; i < orig.v.size(); ++i) {
+            uint32_t o0 = orig.v[i], o1 = orig.v[(i + 1) % orig.v.size()];
+            m.faces.push_back(Face{{o0, o1, base + static_cast<uint32_t>((i + 1) % orig.v.size()),
+                                   base + static_cast<uint32_t>(i)}});
+        }
+        ++added;
+    }
+    if (added == 0) return false;
+    mesh_sync_render(m);
+    return true;
+}
+
+bool catmull_clark(Mesh& m, int levels) {
+    if (m.faces.empty() || m.positions.size() < 4) return false;
+    if (levels < 1 || levels > 4) return false;
+    for (int l = 0; l < levels; ++l) {
+        const size_t n = m.positions.size();
+        auto ekey = [](uint32_t a, uint32_t b) -> uint64_t {
+            uint32_t lo = a < b ? a : b, hi = a < b ? b : a;
+            return (static_cast<uint64_t>(lo) << 32) | hi;
+        };
+        std::map<uint64_t, std::vector<size_t>> edge_faces;
+        for (size_t fi = 0; fi < m.faces.size(); ++fi) {
+            const Face& f = m.faces[fi];
+            size_t nv = f.v.size();
+            for (size_t i = 0; i < nv; ++i) {
+                if (f.v[i] >= n || f.v[(i + 1) % nv] >= n) return false;
+                edge_faces[ekey(f.v[i], f.v[(i + 1) % nv])].push_back(fi);
+            }
+        }
+        std::vector<Vec3> np = m.positions;
+        std::vector<uint32_t> face_pt(m.faces.size(), 0);
+        for (size_t fi = 0; fi < m.faces.size(); ++fi) {
+            const Face& f = m.faces[fi];
+            Vec3 c{0, 0, 0};
+            for (uint32_t v : f.v) c += m.positions[v];
+            face_pt[fi] = static_cast<uint32_t>(np.size());
+            np.push_back(c / float(f.v.size()));
+        }
+        std::vector<Vec3> orig = m.positions;
+        std::map<uint64_t, uint32_t> edge_pt;
+        for (const auto& kv : edge_faces) {
+            uint32_t a = static_cast<uint32_t>(kv.first >> 32);
+            uint32_t b = static_cast<uint32_t>(kv.first & 0xFFFFFFFFu);
+            if (a >= n || b >= n) return false;
+            Vec3 e;
+            if (kv.second.size() >= 2) {
+                e = (orig[a] + orig[b] + np[face_pt[kv.second[0]]] +
+                     np[face_pt[kv.second[1]]]) * 0.25f;
+            } else {
+                e = (orig[a] + orig[b]) * 0.5f;
+            }
+            edge_pt[kv.first] = static_cast<uint32_t>(np.size());
+            np.push_back(e);
+        }
+        std::map<uint32_t, std::vector<uint32_t>> v_edges, v_faces;
+        for (const auto& kv : edge_faces) {
+            uint32_t a = static_cast<uint32_t>(kv.first >> 32);
+            uint32_t b = static_cast<uint32_t>(kv.first & 0xFFFFFFFFu);
+            v_edges[a].push_back(b);
+            v_edges[b].push_back(a);
+            for (size_t fi : kv.second) {
+                v_faces[a].push_back(static_cast<uint32_t>(fi));
+                v_faces[b].push_back(static_cast<uint32_t>(fi));
+            }
+        }
+        std::vector<uint32_t> v_pt(n, 0);
+        for (size_t v = 0; v < n; ++v) {
+            auto fe = v_faces.find(static_cast<uint32_t>(v));
+            auto ee = v_edges.find(static_cast<uint32_t>(v));
+            size_t nf = fe == v_faces.end() ? 0 : fe->second.size();
+            size_t ne = ee == v_edges.end() ? 0 : ee->second.size();
+            if (nf == 0 || ne == 0) {
+                v_pt[v] = static_cast<uint32_t>(np.size());
+                np.push_back(orig[v]);
+                continue;
+            }
+            Vec3 F{0, 0, 0};
+            for (uint32_t fi : fe->second) F += np[face_pt[fi]];
+            F = F / float(nf);
+            Vec3 R{0, 0, 0};
+            for (uint32_t w : ee->second) R += (orig[v] + orig[w]) * 0.5f;
+            R = R / float(ne);
+            float nval = float(ne);
+            Vec3 V = (F + R * 2.0f + orig[v] * (nval - 3.0f)) / nval;
+            v_pt[v] = static_cast<uint32_t>(np.size());
+            np.push_back(V);
+        }
+        std::vector<Face> nf;
+        nf.reserve(m.faces.size() * 4);
+        for (size_t fi = 0; fi < m.faces.size(); ++fi) {
+            const Face& f = m.faces[fi];
+            size_t nv = f.v.size();
+            for (size_t i = 0; i < nv; ++i) {
+                uint32_t cur = f.v[i], nxt = f.v[(i + 1) % nv];
+                uint64_t k1 = ekey(cur, nxt);
+                uint64_t k2 = ekey(nxt, cur);
+                auto it1 = edge_pt.find(k1);
+                if (it1 == edge_pt.end()) it1 = edge_pt.find(k2);
+                if (it1 == edge_pt.end()) return false;
+                nf.push_back(Face{{it1->second, nxt, v_pt[nxt], v_pt[cur]}});
+            }
+        }
+        m.positions = std::move(np);
+        m.faces = std::move(nf);
+    }
+    m.vertices.clear();
+    m.indices.clear();
+    m.tri_face.clear();
+    m.skin.clear();
+    m.joints.clear();
+    m.inv_bind.clear();
     mesh_sync_render(m);
     return true;
 }

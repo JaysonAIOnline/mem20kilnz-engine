@@ -344,42 +344,6 @@ uint32_t acc_u(const Accessor& a, size_t e) {
     return static_cast<uint32_t>(a.v[e]);
 }
 
-Mat4 quat_to_mat(Vec4 q) {
-    float x = q.x, y = q.y, z = q.z, w = q.w;
-    float n = std::sqrt(x * x + y * y + z * z + w * w);
-    if (n > 1e-12f) {
-        x /= n; y /= n; z /= n; w /= n;
-    } else {
-        x = y = z = 0; w = 1;
-    }
-    Mat4 m = Mat4::identity();
-    m.at(0, 0) = 1.0f - 2.0f * (y * y + z * z);
-    m.at(0, 1) = 2.0f * (x * y - z * w);
-    m.at(0, 2) = 2.0f * (x * z + y * w);
-    m.at(1, 0) = 2.0f * (x * y + z * w);
-    m.at(1, 1) = 1.0f - 2.0f * (x * x + z * z);
-    m.at(1, 2) = 2.0f * (y * z - x * w);
-    m.at(2, 0) = 2.0f * (x * z - y * w);
-    m.at(2, 1) = 2.0f * (y * z + x * w);
-    m.at(2, 2) = 1.0f - 2.0f * (x * x + y * y);
-    return m;
-}
-
-Vec3 mat_to_euler_xyz(const Mat4& m) {
-    float cy = std::sqrt(m.at(0, 0) * m.at(0, 0) + m.at(1, 0) * m.at(1, 0));
-    float ax, ay, az;
-    if (cy > 1e-6f) {
-        ax = std::atan2(m.at(2, 1), m.at(1, 1));
-        ay = std::atan2(-m.at(2, 0), cy);
-        az = std::atan2(m.at(1, 0), m.at(0, 0));
-    } else {
-        ax = std::atan2(-m.at(1, 2), m.at(2, 2));
-        ay = std::atan2(-m.at(2, 0), cy);
-        az = 0.0f;
-    }
-    return {rad2deg(ax), rad2deg(ay), rad2deg(az)};
-}
-
 struct Trs {
     Vec3 t{0, 0, 0};
     Vec3 r{0, 0, 0};
@@ -648,7 +612,7 @@ GltfImportStats import_gltf(Scene& scene, const std::string& path, std::string& 
             if (jget(jn, "rotation").is_array() && jn["rotation"].size() >= 4)
                 q = {jn["rotation"][0].get<float>(), jn["rotation"][1].get<float>(),
                      jn["rotation"][2].get<float>(), jn["rotation"][3].get<float>()};
-            local = mul(translate(t), mul(quat_to_mat(q), scale(s)));
+            local = mul(translate(t), mul(quat_to_mat(q.x, q.y, q.z, q.w), scale(s)));
         }
         Trs trs = decompose(local);
         node.translation = trs.t;

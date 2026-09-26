@@ -133,6 +133,11 @@ inline const std::vector<std::string>& op_names() {
         "import", "import_gltf", "import_obj", "export_obj",
         // mesh conditioning
         "decimate", "recalc_normals", "separate_parts", "separate_loose",
+        "subsurf", "subdivide_surface", "catmull_clark", "wireframe", "shrinkwrap",
+        "symmetrize", "mirror_symmetry", "boundary", "extrude_individual",
+        "rotate_verts", "scale_verts", "shear_verts",
+        // animation and ik
+        "frame_at", "set_frame", "ik", "ik_two_bone",
         // inspection
         "describe",
         // camera

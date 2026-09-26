@@ -48,6 +48,11 @@ int add_material(Scene& s, Vec3 albedo) {
     return static_cast<int>(s.materials.size()) - 1;
 }
 
+std::string lower_copy(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
 OpResult fail(const std::string& m) { return {false, m}; }
 OpResult ok(const std::string& m) { return {true, m}; }
 
@@ -1301,6 +1306,162 @@ OpResult apply_op(Document& doc, const nlohmann::json& op) {
         s.active_camera = i;
         if (op.contains("fov")) s.nodes[i].fov_deg = require_f(op, "fov", 50);
         return ok("active camera " + s.nodes[i].name);
+    }
+
+    if (kind == "subdivide_surface" || kind == "subsurf" || kind == "catmull_clark") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("subsurf: no mesh");
+        int levels = int(require_f(op, "levels", require_f(op, "amount", 1.0f)));
+        size_t before = mesh->faces.size();
+        if (!catmull_clark(*mesh, levels)) {
+            if (mutates) doc.undo_once();
+            return fail("subsurf: level count must be 1-4, got " + std::to_string(levels));
+        }
+        return ok("subdivided " + std::to_string(before) + " faces to " +
+                  std::to_string(mesh->faces.size()) + ", " +
+                  std::to_string(mesh->positions.size()) + " verts");
+    }
+
+    if (kind == "wireframe") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("wireframe: no mesh");
+        float t = require_f(op, "thickness", require_f(op, "amount", 0.02f));
+        size_t before = mesh->faces.size();
+        if (!wireframe_mesh(*mesh, t)) {
+            if (mutates) doc.undo_once();
+            return fail("wireframe: mesh has no edges, or thickness is not positive");
+        }
+        return ok("wireframe " + std::to_string(before) + " faces to " +
+                  std::to_string(mesh->faces.size()) + ", thickness " + std::to_string(t));
+    }
+
+    if (kind == "shrinkwrap") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("shrinkwrap: no mesh");
+        int ti = resolve_node(s, op);
+        if (ti < 0 || ti >= static_cast<int>(s.nodes.size()) ||
+            s.nodes[static_cast<size_t>(ti)].mesh < 0)
+            return fail("shrinkwrap: name a target mesh node");
+        const Mesh& target = s.meshes[static_cast<size_t>(s.nodes[static_cast<size_t>(ti)].mesh)];
+        if (&target == mesh) return fail("shrinkwrap: target is the same mesh");
+        float w = require_f(op, "weight", 1.0f);
+        if (!shrinkwrap_mesh(*mesh, target, w)) {
+            if (mutates) doc.undo_once();
+            return fail("shrinkwrap: nothing to wrap, or weight is not in (0, 1]");
+        }
+        return ok("shrinkwrapped " + std::to_string(mesh->positions.size()) + " verts onto " +
+                  s.nodes[static_cast<size_t>(ti)].name + " at weight " + std::to_string(w));
+    }
+
+    if (kind == "symmetrize" || kind == "mirror_symmetry") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("symmetrize: no mesh");
+        std::string ax = lower_copy(require_str(op, "axis", "x"));
+        int axis = ax == "x" ? 0 : (ax == "y" ? 1 : (ax == "z" ? 2 : -1));
+        if (axis < 0) return fail("symmetrize: axis must be x, y or z");
+        size_t before = mesh->faces.size();
+        if (!symmetrize_mesh(*mesh, axis)) {
+            if (mutates) doc.undo_once();
+            return fail("symmetrize: no face lies wholly on one side of the " + ax + " plane");
+        }
+        return ok("symmetrized across " + ax + ": " + std::to_string(before) + " faces to " +
+                  std::to_string(mesh->faces.size()) + ", " +
+                  std::to_string(mesh->positions.size()) + " verts");
+    }
+
+    if (kind == "boundary") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("boundary: no mesh");
+        std::vector<int> b = boundary_faces(*mesh);
+        return {true, std::to_string(b.size()) + " boundary faces of " +
+                         std::to_string(mesh->faces.size()),
+                {{"boundary_faces", b.size()}, {"total_faces", mesh->faces.size()}}};
+    }
+
+    if (kind == "extrude_individual") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("extrude_individual: no mesh");
+        std::vector<int> faces = s.face_sel;
+        if (faces.empty()) return fail("extrude_individual: select faces first");
+        float amount = require_f(op, "amount", 0.0f);
+        std::vector<int> ns;
+        if (!extrude_individual(*mesh, faces, amount, ns)) {
+            if (mutates) doc.undo_once();
+            return fail("extrude_individual: amount must be non-zero");
+        }
+        s.face_sel = ns;
+        return ok("extruded " + std::to_string(ns.size()) + " faces individually by " +
+                  std::to_string(amount));
+    }
+
+    if (kind == "rotate_verts") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("rotate_verts: no mesh");
+        std::vector<uint32_t> vs = current_verts(s, *mesh);
+        Vec3 e = require_vec3(op, "rotation", {0, 0, 0});
+        if (length(e) < 1e-9f) e = require_vec3(op, "delta", {0, 0, 0});
+        if (!rotate_verts(*mesh, vs, e)) {
+            if (mutates) doc.undo_once();
+            return fail("rotate_verts: no vertices to rotate");
+        }
+        return ok("rotated " + std::to_string(vs.size()) + " verts by " +
+                  std::to_string(e.x) + "," + std::to_string(e.y) + "," + std::to_string(e.z));
+    }
+
+    if (kind == "scale_verts") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("scale_verts: no mesh");
+        std::vector<uint32_t> vs = current_verts(s, *mesh);
+        Vec3 s3 = require_vec3(op, "scale", {1, 1, 1});
+        if (op.contains("factor")) {
+            float f = require_f(op, "factor", 1.0f);
+            s3 = {f, f, f};
+        }
+        if (!scale_verts(*mesh, vs, s3)) {
+            if (mutates) doc.undo_once();
+            return fail("scale_verts: no vertices, or a scale component is zero");
+        }
+        return ok("scaled " + std::to_string(vs.size()) + " verts by " +
+                  std::to_string(s3.x) + "," + std::to_string(s3.y) + "," + std::to_string(s3.z));
+    }
+
+    if (kind == "shear_verts") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("shear_verts: no mesh");
+        std::vector<uint32_t> vs = current_verts(s, *mesh);
+        std::string ax = lower_copy(require_str(op, "axis", "x"));
+        Vec3 axis = ax == "y" ? Vec3{0, 1, 0} : (ax == "z" ? Vec3{0, 0, 1} : Vec3{1, 0, 0});
+        float factor = require_f(op, "factor", require_f(op, "amount", 0.0f));
+        if (!shear_verts(*mesh, vs, axis, factor)) {
+            if (mutates) doc.undo_once();
+            return fail("shear_verts: axis must be x, y or z and factor non-zero");
+        }
+        return ok("sheared " + std::to_string(vs.size()) + " verts along " + ax + " by " +
+                  std::to_string(factor));
+    }
+
+    if (kind == "frame_at" || kind == "set_frame") {
+        int f = int(require_f(op, "frame", float(s.frame)));
+        apply_frame(s, f);
+        return ok("frame " + std::to_string(s.frame) + " applied to " +
+                  std::to_string(s.keys.size()) + " keys");
+    }
+
+    if (kind == "ik" || kind == "ik_two_bone") {
+        int i = resolve_node(s, op);
+        if (i < 0 || i >= static_cast<int>(s.nodes.size()) ||
+            s.nodes[static_cast<size_t>(i)].type != NodeType::Bone)
+            return fail("ik: target must be a bone");
+        Vec3 target = require_vec3(op, "target", {0, 0, 0});
+        if (op.contains("at")) target = require_vec3(op, "at", target);
+        if (length(target) < 1e-9f) return fail("ik: needs a 'target' or 'at' position");
+        std::string tn = s.nodes[static_cast<size_t>(i)].name;
+        if (!ik_two_bone(s, i, target)) {
+            if (mutates) doc.undo_once();
+            return fail("ik: " + tn + " needs a parent and grandparent bone, and non-zero lengths");
+        }
+        return ok("solved two-bone IK for " + tn + " toward " + std::to_string(target.x) + "," +
+                  std::to_string(target.y) + "," + std::to_string(target.z));
     }
 
     if (kind == "import_obj") {
