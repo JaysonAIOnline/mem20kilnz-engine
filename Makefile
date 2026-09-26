@@ -7,10 +7,12 @@ SRCS = \
   src/scene/scene.cpp \
   src/scene/edit.cpp \
   src/scene/rig.cpp \
+  src/scene/mesh_ops.cpp \
   src/ops/ops.cpp \
   src/agent/agent.cpp \
   src/io/gltf.cpp \
   src/io/gltf_import.cpp \
+  src/io/obj.cpp \
   src/render/software.cpp \
   src/rpc/rpc.cpp \
   src/app.cpp \

@@ -1303,6 +1303,106 @@ OpResult apply_op(Document& doc, const nlohmann::json& op) {
         return ok("active camera " + s.nodes[i].name);
     }
 
+    if (kind == "import_obj") {
+        std::string path = require_str(op, "path");
+        if (path.empty()) return fail("import_obj needs 'path'");
+        size_t nodes_before = s.nodes.size();
+        size_t meshes_before = s.meshes.size();
+        ObjImportNotes notes;
+        std::string err;
+        if (!import_obj(s, path, err, notes)) {
+            s.nodes.resize(nodes_before);
+            s.meshes.resize(meshes_before);
+            return fail("import_obj failed: " + err);
+        }
+        if (op.value("replace", false)) {
+            s.next_id = 1;
+            s.selection = -1;
+            s.active_camera = -1;
+        }
+        std::string msg = "imported " + path + ": " + std::to_string(notes.meshes) + " meshes, " +
+                          std::to_string(notes.faces) + " faces, " +
+                          std::to_string(notes.vertices) + " verts";
+        nlohmann::json data = {{"meshes", notes.meshes},
+                               {"faces", notes.faces},
+                               {"vertices", notes.vertices}};
+        std::vector<std::string> dropped;
+        if (notes.had_uvs) dropped.push_back("vt");
+        if (notes.had_normals) dropped.push_back("vn");
+        if (!dropped.empty()) {
+            msg += " (dropped:";
+            for (const auto& d : dropped) msg += " " + d;
+            msg += ")";
+            data["dropped_attributes"] = dropped;
+        }
+        return {true, msg, data};
+    }
+
+    if (kind == "export_obj") {
+        std::string path = require_str(op, "path");
+        if (path.empty()) return fail("export_obj needs 'path'");
+        std::string err;
+        if (!export_obj(s, path, err)) return fail("export_obj failed: " + err);
+        return ok("wrote " + path);
+    }
+
+    if (kind == "decimate") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("decimate: no mesh");
+        if (mesh->faces.size() < 4) return fail("decimate: mesh has fewer than 4 faces");
+        size_t before_faces = mesh->faces.size();
+        size_t before_verts = mesh->positions.size();
+        float ratio = require_f(op, "ratio", 0.0f);
+        if (!(ratio > 0.0f) || ratio >= 1.0f)
+            return fail("decimate: ratio must be in (0, 1), got " + std::to_string(ratio));
+        if (!decimate_mesh(*mesh, ratio)) {
+            if (mutates) doc.undo_once();
+            return fail("decimate: no valid collapse found at ratio " + std::to_string(ratio));
+        }
+        std::string msg = "decimated " + std::to_string(before_faces) + " faces to " +
+                          std::to_string(mesh->faces.size()) + ", " +
+                          std::to_string(before_verts) + " verts to " +
+                          std::to_string(mesh->positions.size());
+        return {true, msg, {{"faces_before", before_faces},
+                            {"faces_after", mesh->faces.size()},
+                            {"verts_before", before_verts},
+                            {"verts_after", mesh->positions.size()},
+                            {"ratio", ratio}}};
+    }
+
+    if (kind == "recalc_normals") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("recalc_normals: no mesh");
+        if (!recalc_normals(*mesh)) {
+            if (mutates) doc.undo_once();
+            return fail("recalc_normals: mesh has no faces");
+        }
+        return ok("recalculated normals on " + std::to_string(mesh->positions.size()) + " verts");
+    }
+
+    if (kind == "separate_parts" || kind == "separate_loose") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("separate_parts: no mesh");
+        int ni = s.selection;
+        std::vector<Mesh> parts = separate_loose_meshes(*mesh);
+        if (parts.size() < 2) return fail("separate_parts: mesh is already one connected piece");
+        s.meshes[static_cast<size_t>(s.nodes[static_cast<size_t>(ni)].mesh)] = std::move(parts[0]);
+        for (size_t i = 1; i < parts.size(); ++i) {
+            Node child;
+            child.name = s.unique_name(mesh->name + "_part" + std::to_string(i));
+            child.type = NodeType::Mesh;
+            child.parent = ni;
+            child.material = s.nodes[static_cast<size_t>(ni)].material;
+            child.translation = s.nodes[static_cast<size_t>(ni)].translation;
+            child.rotation_deg = s.nodes[static_cast<size_t>(ni)].rotation_deg;
+            child.scale = s.nodes[static_cast<size_t>(ni)].scale;
+            child.mesh = static_cast<int>(s.meshes.size());
+            s.meshes.push_back(std::move(parts[i]));
+            s.add_node(child);
+        }
+        return ok("separated " + std::to_string(parts.size()) + " connected pieces");
+    }
+
     if (kind == "import" || kind == "import_gltf") {
         std::string path = require_str(op, "path");
         if (path.empty()) return fail("import needs 'path'");

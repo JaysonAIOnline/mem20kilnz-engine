@@ -50,7 +50,22 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
 // merely unrepresentable is counted in the stats instead of aborting.
 GltfImportStats import_gltf(Scene& scene, const std::string& path, std::string& err);
 
+// What an OBJ import actually brought in. `vt` and `vn` are read but not
+// retained, because the Mesh model has nowhere to keep per-vertex attributes;
+// the op reports them rather than dropping them silently.
+struct ObjImportNotes {
+    bool had_uvs = false;
+    bool had_normals = false;
+    size_t meshes = 0;
+    size_t faces = 0;
+    size_t vertices = 0;
+};
+
 bool save_scene(const Scene& scene, const std::string& path, std::string& err);
 bool load_scene(Scene& scene, const std::string& path, std::string& err);
+
+bool import_obj(Scene& scene, const std::string& path, std::string& err);
+bool import_obj(Scene& scene, const std::string& path, std::string& err, ObjImportNotes& notes);
+bool export_obj(const Scene& scene, const std::string& path, std::string& err);
 
 }  // namespace kiln

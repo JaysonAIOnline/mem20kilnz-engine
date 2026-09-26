@@ -129,6 +129,10 @@ inline const std::vector<std::string>& op_names() {
         "rig", "bind", "pose", "rest", "shape",
         // level of detail
         "lod",
+        // import / export
+        "import", "import_gltf", "import_obj", "export_obj",
+        // mesh conditioning
+        "decimate", "recalc_normals", "separate_parts", "separate_loose",
         // inspection
         "describe",
         // camera

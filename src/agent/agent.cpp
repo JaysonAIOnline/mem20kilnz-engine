@@ -192,6 +192,38 @@ bool dsl_command(const std::string& line, nlohmann::json& ops) {
         ops = nlohmann::json::array({{{"op", "redo"}}});
         return true;
     }
+    if (c == "import_obj") {
+        if (t.size() < 2) return false;
+        nlohmann::json op = {{"op", "import_obj"}, {"path", t[1]}};
+        for (size_t i = 2; i < t.size(); ++i)
+            if (lower_copy(t[i]) == "replace") op["replace"] = true;
+        ops = nlohmann::json::array({op});
+        return true;
+    }
+    if (c == "export_obj") {
+        if (t.size() < 2) return false;
+        ops = nlohmann::json::array({{{"op", "export_obj"}, {"path", t[1]}}});
+        return true;
+    }
+    if (c == "decimate") {
+        nlohmann::json op = {{"op", "decimate"}};
+        for (size_t i = 1; i < t.size(); ++i) {
+            std::string k = lower_copy(t[i]);
+            if (k == "ratio" && i + 1 < t.size()) op["ratio"] = to_f(t[++i]);
+            else if (is_number(t[i])) op["ratio"] = to_f(t[i]);
+        }
+        if (!op.contains("ratio")) return false;
+        ops = nlohmann::json::array({op});
+        return true;
+    }
+    if (c == "recalc_normals" || c == "recalc" || c == "fix_normals") {
+        ops = nlohmann::json::array({{{"op", "recalc_normals"}}});
+        return true;
+    }
+    if (c == "separate_parts" || c == "separate_loose") {
+        ops = nlohmann::json::array({{{"op", "separate_parts"}}});
+        return true;
+    }
     if (c == "import" || c == "import_gltf" || c == "open_gltf") {
         if (t.size() < 2) return false;
         nlohmann::json op = {{"op", "import"}, {"path", t[1]}};
