@@ -112,7 +112,7 @@ bool m_op(Session& s, const json& params, json& result, int& code, std::string& 
         return false;
     }
     OpResult r = apply_op(s.doc, params);
-    result = op_result_json(r.ok, r.message);
+    result = op_result_json(r.ok, r.message, r.data);
     return true;
 }
 
@@ -129,7 +129,9 @@ bool m_ops(Session& s, const json& params, json& result, int& code, std::string&
     bool all_ok = true;
     for (std::size_t i = 0; i < params.size(); ++i) {
         OpResult r = apply_op(s.doc, params[i]);
-        applied.push_back(op_result_json(r.ok, r.message, {{"index", static_cast<int>(i)}}));
+        applied.push_back(op_result_json(r.ok, r.message,
+                                           {{"index", static_cast<int>(i)},
+                                            {"op_data", r.data}}));
         if (!r.ok) {
             all_ok = false;
             break;
