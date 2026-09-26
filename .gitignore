@@ -1,6 +1,9 @@
 /build/
 /kiln
 *.o
+*.d
 *.spv
 .cache/
 compile_commands.json
+__pycache__/
+*.pyc
