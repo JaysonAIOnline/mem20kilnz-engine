@@ -192,6 +192,14 @@ bool dsl_command(const std::string& line, nlohmann::json& ops) {
         ops = nlohmann::json::array({{{"op", "redo"}}});
         return true;
     }
+    if (c == "import" || c == "import_gltf" || c == "open_gltf") {
+        if (t.size() < 2) return false;
+        nlohmann::json op = {{"op", "import"}, {"path", t[1]}};
+        for (size_t i = 2; i < t.size(); ++i)
+            if (lower_copy(t[i]) == "replace") op["replace"] = true;
+        ops = nlohmann::json::array({op});
+        return true;
+    }
     if (c == "create" || c == "add" || c == "mk") {
         if (t.size() < 2) return false;
         std::string primtok = lower_copy(t[1]);

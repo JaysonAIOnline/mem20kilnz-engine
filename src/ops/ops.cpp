@@ -1,5 +1,7 @@
 #include "ops.hpp"
 
+#include "../io/gltf.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -1299,6 +1301,70 @@ OpResult apply_op(Document& doc, const nlohmann::json& op) {
         s.active_camera = i;
         if (op.contains("fov")) s.nodes[i].fov_deg = require_f(op, "fov", 50);
         return ok("active camera " + s.nodes[i].name);
+    }
+
+    if (kind == "import" || kind == "import_gltf") {
+        std::string path = require_str(op, "path");
+        if (path.empty()) return fail("import needs 'path'");
+        bool replace = op.value("replace", false);
+        size_t nodes_before = s.nodes.size();
+        size_t meshes_before = s.meshes.size();
+        size_t materials_before = s.materials.size();
+        GltfImportStats st;
+        std::string err;
+        st = import_gltf(s, path, err);
+        if (!err.empty()) {
+            s.nodes.resize(nodes_before);
+            s.meshes.resize(meshes_before);
+            s.materials.resize(materials_before);
+            return fail("import failed: " + err);
+        }
+        if (st.meshes == 0 && st.cameras == 0 && st.materials == 0) {
+            s.nodes.resize(nodes_before);
+            s.meshes.resize(meshes_before);
+            s.materials.resize(materials_before);
+            return fail("import read no geometry from " + path);
+        }
+        if (replace) {
+            s.next_id = 1;
+            s.selection = -1;
+            s.active_camera = -1;
+        }
+        nlohmann::json data = nlohmann::json::object();
+        data["nodes"] = st.nodes;
+        data["meshes"] = st.meshes;
+        data["primitives"] = st.primitives;
+        data["materials"] = st.materials;
+        data["faces"] = st.faces;
+        data["vertices"] = st.vertices;
+        data["cameras"] = st.cameras;
+        data["skins"] = st.skins;
+        data["bones"] = st.bones;
+        data["skinned_vertices"] = st.skinned_vertices;
+        data["skipped_modes"] = st.skipped_modes;
+        if (!st.dropped_attributes.empty()) data["dropped_attributes"] = st.dropped_attributes;
+        if (!st.unsupported_extensions.empty())
+            data["unsupported_extensions"] = st.unsupported_extensions;
+        std::string msg = "imported " + path + ": " + std::to_string(st.meshes) + " meshes, " +
+                          std::to_string(st.faces) + " faces, " +
+                          std::to_string(st.vertices) + " verts, " +
+                          std::to_string(st.materials) + " materials";
+        if (st.skins > 0)
+            msg += ", " + std::to_string(st.skins) + " skins/" + std::to_string(st.bones) +
+                   " bones";
+        if (st.skipped_modes > 0)
+            msg += ", " + std::to_string(st.skipped_modes) + " primitives skipped";
+        if (!st.dropped_attributes.empty()) {
+            msg += " (dropped:";
+            for (const auto& a : st.dropped_attributes) msg += " " + a;
+            msg += ")";
+        }
+        if (!st.unsupported_extensions.empty()) {
+            msg += " (unhandled extensions:";
+            for (const auto& e : st.unsupported_extensions) msg += " " + e;
+            msg += ")";
+        }
+        return {true, msg, data};
     }
 
     if (mutates) {

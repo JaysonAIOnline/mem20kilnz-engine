@@ -11,6 +11,7 @@ namespace kiln {
 struct OpResult {
     bool ok = true;
     std::string message;
+    nlohmann::json data = nlohmann::json::object();
 };
 
 struct Document {

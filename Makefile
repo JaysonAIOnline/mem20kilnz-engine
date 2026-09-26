@@ -10,6 +10,7 @@ SRCS = \
   src/ops/ops.cpp \
   src/agent/agent.cpp \
   src/io/gltf.cpp \
+  src/io/gltf_import.cpp \
   src/render/software.cpp \
   src/rpc/rpc.cpp \
   src/app.cpp \
