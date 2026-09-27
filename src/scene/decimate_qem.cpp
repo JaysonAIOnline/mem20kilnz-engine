@@ -406,69 +406,112 @@ bool decimate_qem(Mesh& m, float ratio, int max_collapses) {
         m.positions[a] = e.target;
         vq[a] = vq[a] + vq[b];
 
-        // ---- link condition and hole retriangulation ----
+        // ---- hole boundary, in order ----
         //
-        // Collapsing an edge whose two faces are triangles deletes both of them,
-        // and deleting both punches a hole in the surface. That is why a naive
-        // edge-collapse decimator loses volume: it was tearing the mesh open
-        // rather than reducing it. The link condition says which vertices bound
-        // the resulting hole, and that loop is fan-triangulated from the
-        // surviving vertex.
+        // Collapsing (a, b) deletes the two triangles that shared the edge, and
+        // deleting both punches a hole. The hole has to be retriangulated, and
+        // the boundary has to be the hole's boundary *in cyclic order* -- the
+        // previous version collected every neighbour of `a` instead, which added
+        // more faces than the collapse removed and turned a 528-triangle sphere
+        // into 1,470.
         //
-        // Link(a, b) is the set of faces touching a or b. Opposite vertices are
-        // the ones across the (a, b) edge in each of its two incident faces. The
-        // collapse is legal when the two endpoint 1-rings share exactly those
-        // two vertices and nothing else; anything else would create a
-        // non-manifold fan.
-        auto one_ring = [&](uint32_t v) {
-            std::set<uint32_t> r;
-            for (uint32_t fi : v2f[v]) {
+        // The boundary is built the textbook way. With the link condition
+        // satisfied, the two endpoints share exactly the opposite vertices c and
+        // d, so the hole is bounded by: c, then b's remaining neighbours in the
+        // order they wrap around b, then d, then a's remaining neighbours coming
+        // back the other way. Fanning that loop from `a` closes the surface.
+        std::vector<uint32_t> hole;
+        {
+            // Neighbours of `v` in cyclic order, starting from `from`.
+            // Walks the face fan around the vertex, which is the only way to
+            // recover adjacency: a set has no order and a wrong order produces
+            // overlapping triangles.
+            auto ordered_ring = [&](uint32_t v, uint32_t from) {
+                std::vector<uint32_t> ring;
+                std::set<uint32_t> seen;
+                if (from >= nv || vdead[v]) return ring;
+                // Start from the face that contains (v, from).
+                uint32_t seed = UINT32_MAX;
+                for (uint32_t fi : v2f[v]) {
+                    if (fi >= m.faces.size() || !face_alive[fi]) continue;
+                    for (size_t i = 0; i < m.faces[fi].v.size(); ++i) {
+                        const uint32_t u = m.faces[fi].v[i];
+                        const uint32_t w = m.faces[fi].v[(i + 1) % m.faces[fi].v.size()];
+                        if ((u == v && w == from) || (w == v && u == from)) {
+                            seed = fi;
+                            break;
+                        }
+                    }
+                    if (seed != UINT32_MAX) break;
+                }
+                if (seed == UINT32_MAX) return ring;
+                // Walk forward from `from` through the fan, then wrap back.
+                uint32_t cur = from;
+                uint32_t prev = v;
+                for (size_t step = 0; step < m.faces.size() + 2; ++step) {
+                    uint32_t next = UINT32_MAX;
+                    for (uint32_t fi : v2f[v]) {
+                        if (fi >= m.faces.size() || !face_alive[fi]) continue;
+                        const Face& f = m.faces[fi];
+                        for (size_t i = 0; i < f.v.size(); ++i) {
+                            if (f.v[i] != v) continue;
+                            const uint32_t u = f.v[(i + 1) % f.v.size()];
+                            const uint32_t w = f.v[(i + f.v.size() - 1) % f.v.size()];
+                            if (u == prev && w != v) { next = w; break; }
+                            if (w == prev && u != v) { next = u; break; }
+                        }
+                        if (next != UINT32_MAX) break;
+                    }
+                    if (next == UINT32_MAX || next == from) break;
+                    if (seen.insert(next).second) ring.push_back(next);
+                    prev = cur;
+                    cur = next;
+                    if (cur == from) break;
+                }
+                return ring;
+            };
+
+            // The two vertices opposite the (a, b) edge.
+            uint32_t c = UINT32_MAX, d = UINT32_MAX;
+            for (uint32_t fi : v2f[a]) {
                 if (fi >= m.faces.size() || !face_alive[fi]) continue;
-                for (uint32_t x : m.faces[fi].v) {
-                    if (x != v && x < nv) r.insert(x);
+                const Face& f = m.faces[fi];
+                if (f.v.size() != 3) continue;
+                if (!(f.v[0] == b || f.v[1] == b || f.v[2] == b)) continue;
+                for (uint32_t x : f.v) {
+                    if (x != a && x != b) {
+                        if (c == UINT32_MAX) c = x;
+                        else if (x != c) d = x;
+                    }
                 }
             }
-            return r;
-        };
-        const std::set<uint32_t> ring_a = one_ring(a);
-        const std::set<uint32_t> ring_b = one_ring(b);
-        std::vector<uint32_t> opposite;
-        for (uint32_t fi : v2f[a]) {
-            if (fi >= m.faces.size() || !face_alive[fi]) continue;
-            const Face& f = m.faces[fi];
-            if (f.v.size() != 3) continue;
-            const bool has_b = f.v[0] == b || f.v[1] == b || f.v[2] == b;
-            if (!has_b) continue;
-            for (uint32_t x : f.v) {
-                if (x != a && x != b) opposite.push_back(x);
+            if (c == UINT32_MAX || d == UINT32_MAX) {
+                continue;  // not an interior edge; the earlier checks caught this
             }
-        }
-        std::set<uint32_t> shared;
-        std::set_intersection(ring_a.begin(), ring_a.end(),
-                               ring_b.begin(), ring_b.end(),
-                               std::inserter(shared, shared.begin()));
-        std::set<uint32_t> opp_set(opposite.begin(), opposite.end());
-        // Faces that will be removed by this collapse, and the loop that bounds
-        // the hole they leave.
-        std::vector<uint32_t> dying;
-        for (uint32_t fi : v2f[b]) {
-            if (fi >= m.faces.size() || !face_alive[fi]) continue;
-            const Face& f = m.faces[fi];
-            bool has_a = f.v[0] == a || f.v[1] == a || f.v[2] == a;
-            if (has_a && f.v.size() == 3) dying.push_back(fi);
-        }
-        // The hole boundary, walked from the surviving vertex outward.
-        std::vector<uint32_t> loop;
-        {
-            std::set<uint32_t> on_dead;
-            for (uint32_t fi : dying) {
-                for (uint32_t x : m.faces[fi].v) on_dead.insert(x);
+
+            // b's side: c -> (b's other neighbours) -> d
+            const std::vector<uint32_t> ring_b = ordered_ring(b, c);
+            // a's side: c -> (a's other neighbours) -> d, traversed the other way
+            std::vector<uint32_t> ring_a = ordered_ring(a, c);
+            std::reverse(ring_a.begin(), ring_a.end());
+
+            hole.push_back(c);
+            for (uint32_t x : ring_b) {
+                if (x != a && x != d) hole.push_back(x);
             }
-            on_dead.erase(a);
-            on_dead.erase(b);
+            hole.push_back(d);
             for (uint32_t x : ring_a) {
-                if (x != b && on_dead.count(x) == 0) loop.push_back(x);
+                if (x != b && x != c) hole.push_back(x);
             }
+            // Drop any repeat: a repeated vertex would make a zero-area fan
+            // triangle, and a zero-area triangle is a degenerate.
+            std::set<uint32_t> uniq;
+            std::vector<uint32_t> clean;
+            for (uint32_t x : hole) {
+                if (x == UINT32_MAX || x == a || x == b) continue;
+                if (uniq.insert(x).second) clean.push_back(x);
+            }
+            hole = clean;
         }
 
         // Fold b's faces into a. Faces that become slivers die, and a dying face
@@ -521,11 +564,11 @@ bool decimate_qem(Mesh& m, float ratio, int max_collapses) {
         // Close the hole the collapse left. Without this the surface is torn
         // open, which measured as 100-140 boundary edges and up to 93% volume
         // loss -- worse than the vertex clustering it was meant to replace.
-        if (loop.size() >= 3) {
+        if (hole.size() >= 3) {
             // Add a live face slot for each new triangle.
-            for (size_t i = 1; i + 1 < loop.size(); ++i) {
+            for (size_t i = 1; i + 1 < hole.size(); ++i) {
                 Face nf;
-                nf.v = {a, loop[i], loop[i + 1]};
+                nf.v = {a, hole[i], hole[i + 1]};
                 bool dup = false;
                 for (size_t k = 0; k < nf.v.size(); ++k) {
                     if (nf.v[k] == nf.v[(k + 1) % nf.v.size()]) dup = true;
@@ -536,16 +579,16 @@ bool decimate_qem(Mesh& m, float ratio, int max_collapses) {
                 face_alive.push_back(true);
                 face_n.resize(m.faces.size(), Vec3{0, 1, 0});
                 v2f[a].push_back(nfi);
-                for (size_t k = 1; k + 1 < loop.size(); ++k) {
-                    v2f[loop[k]].push_back(nfi);
-                    v2f[loop[k + 1]].push_back(nfi);
+                for (size_t k = 1; k + 1 < hole.size(); ++k) {
+                    v2f[hole[k]].push_back(nfi);
+                    v2f[hole[k + 1]].push_back(nfi);
                 }
-                for (size_t k = 1; k + 1 < loop.size(); ++k) {
-                    bump_edge(loop[k], loop[k + 1], +1);
+                for (size_t k = 1; k + 1 < hole.size(); ++k) {
+                    bump_edge(hole[k], hole[k + 1], +1);
                 }
-                if (loop.size() >= 2) {
-                    bump_edge(a, loop[1], +1);
-                    bump_edge(a, loop[loop.size() - 1], +1);
+                if (hole.size() >= 2) {
+                    bump_edge(a, hole[1], +1);
+                    bump_edge(a, hole[hole.size() - 1], +1);
                 }
                 ++live_faces;
             }

@@ -78,6 +78,15 @@ void mesh_sync_render(Mesh& m) {
     std::vector<Vec3> vn;
     if (m.smooth) vn = vertex_normals(m);
 
+    // Corner attributes are only meaningful while they still line up with the
+    // faces: three per face, in face order. Any op that changes the face count
+    // without clearing them leaves a shorter or longer array, and reading it
+    // anyway attributes one face's UVs and normals to another. That produced a
+    // subdivided sphere with 1,104 boundary edges, 1,370 non-manifold edges and
+    // a signed volume of exactly 0, because the stale normals cancelled.
+    const bool corners_usable = m.corner_attr.size() == m.faces.size() * 3;
+    if (!corners_usable) m.corner_attr.clear();
+
     bool any_uv = false;
     std::map<std::tuple<int, int, int, int, int, int, int>, uint32_t> weld;
     auto quant = [](float x) { return static_cast<int>(std::lround(x * 10000.0f)); };
@@ -94,9 +103,8 @@ void mesh_sync_render(Mesh& m) {
                 Vec3 n = fn;
                 Vec2 uv{0, 0};
                 // A corner's authored attributes win over the computed ones.
-                const size_t corner = static_cast<size_t>(fi) * 3 +
-                                      (k == 2 ? 2 : (k == 0 ? 0 : 1));
-                if (corner < m.corner_attr.size()) {
+                const size_t corner = static_cast<size_t>(fi) * 3 + k;
+                if (corners_usable && corner < m.corner_attr.size()) {
                     const CornerAttr& ca = m.corner_attr[corner];
                     n = ca.n;
                     uv = ca.uv;

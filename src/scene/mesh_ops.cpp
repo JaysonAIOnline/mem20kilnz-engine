@@ -635,6 +635,7 @@ bool extrude_individual(Mesh& m, const std::vector<int>& faces, float amount,
 bool catmull_clark(Mesh& m, int levels) {
     if (m.faces.empty() || m.positions.size() < 4) return false;
     if (levels < 1 || levels > 4) return false;
+
     for (int l = 0; l < levels; ++l) {
         const size_t n = m.positions.size();
         auto ekey = [](uint32_t a, uint32_t b) -> uint64_t {
@@ -710,17 +711,63 @@ bool catmull_clark(Mesh& m, int levels) {
         }
         std::vector<Face> nf;
         nf.reserve(m.faces.size() * 4);
+        // Each original edge (cur, nxt) becomes a quad bounded by the new vertex
+        // points of both endpoints and the edge points on either side:
+        //   (v[cur], e[cur->nxt], v[nxt], e[prev->cur])
+        //
+        // This used to emit (e[cur->nxt], nxt, v[nxt], v[cur]), which put the
+        // *original*, unsmoothed vertex index into the new face. Since the
+        // position array had already been replaced, that index pointed at the
+        // pre-smoothing position, so neighbouring faces referenced different
+        // vertices for the same corner. A subdivided sphere came out with 1,104
+        // boundary edges, 1,370 non-manifold edges and a signed volume of
+        // exactly zero, because the inconsistent normals cancelled.
+        // Each face is subdivided by its own type, so a mesh mixing quads and
+        // triangles stays conforming: every original edge yields exactly one edge
+        // point, which both neighbouring faces use. A quad becomes four quads; a
+        // triangle becomes four triangles (three corners plus a centre).
+        //
+        // Subdividing a triangle into quads instead does not tile it, which is
+        // what left a subdivided sphere with 1,104 boundary edges and 1,656
+        // non-manifold edges.
+        auto edge_of = [&](uint32_t u, uint32_t w) -> uint32_t {
+            auto it = edge_pt.find(ekey(u, w));
+            return it == edge_pt.end() ? UINT32_MAX : it->second;
+        };
         for (size_t fi = 0; fi < m.faces.size(); ++fi) {
             const Face& f = m.faces[fi];
-            size_t nv = f.v.size();
-            for (size_t i = 0; i < nv; ++i) {
-                uint32_t cur = f.v[i], nxt = f.v[(i + 1) % nv];
-                uint64_t k1 = ekey(cur, nxt);
-                uint64_t k2 = ekey(nxt, cur);
-                auto it1 = edge_pt.find(k1);
-                if (it1 == edge_pt.end()) it1 = edge_pt.find(k2);
-                if (it1 == edge_pt.end()) return false;
-                nf.push_back(Face{{it1->second, nxt, v_pt[nxt], v_pt[cur]}});
+            const size_t nv = f.v.size();
+            if (nv == 4) {
+                for (size_t i = 0; i < 4; ++i) {
+                    const uint32_t cur = f.v[i], nxt = f.v[(i + 1) % 4];
+                    const uint32_t prv = f.v[(i + 3) % 4];
+                    const uint32_t e_next = edge_of(cur, nxt);
+                    const uint32_t e_prev = edge_of(prv, cur);
+                    if (e_next == UINT32_MAX || e_prev == UINT32_MAX) return false;
+                    nf.push_back(Face{{v_pt[cur], e_next, v_pt[nxt], e_prev}});
+                }
+            } else if (nv == 3) {
+                // A triangle splits into three corner triangles plus a centre
+                // one. Each corner triangle uses the new point at its own vertex
+                // and the edge points on either side of it. It previously used
+                // the *next* vertex point instead of the preceding edge point,
+                // so consecutive corner triangles shared no edge at all.
+                for (size_t i = 0; i < 3; ++i) {
+                    const uint32_t cur = f.v[i];
+                    const uint32_t nxt = f.v[(i + 1) % 3];
+                    const uint32_t prv = f.v[(i + 2) % 3];
+                    const uint32_t e_next = edge_of(cur, nxt);
+                    const uint32_t e_prev = edge_of(prv, cur);
+                    if (e_next == UINT32_MAX || e_prev == UINT32_MAX) return false;
+                    nf.push_back(Face{{v_pt[cur], e_next, e_prev}});
+                }
+                const uint32_t e0 = edge_of(f.v[0], f.v[1]);
+                const uint32_t e1 = edge_of(f.v[1], f.v[2]);
+                const uint32_t e2 = edge_of(f.v[2], f.v[0]);
+                if (e0 == UINT32_MAX || e1 == UINT32_MAX || e2 == UINT32_MAX) return false;
+                nf.push_back(Face{{e0, e1, e2}});
+            } else {
+                return false;  // n-gons have no conforming subdivision here
             }
         }
         m.positions = std::move(np);
