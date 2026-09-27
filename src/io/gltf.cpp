@@ -113,6 +113,7 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
     g["scene"] = 0;
     nlohmann::json sc = nlohmann::json::object();
     sc["name"] = scene.name;
+    g["skins"] = nlohmann::json::array();
     sc["nodes"] = nlohmann::json::array();
     g["scenes"] = nlohmann::json::array({sc});
 
@@ -139,6 +140,8 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
     }
 
     std::vector<int> mesh_gltf(scene.meshes.size(), -1);
+    // glTF skin index per mesh, -1 when the mesh is not skinned.
+    std::vector<int> mesh_skin_gltf(scene.meshes.size(), -1);
     for (size_t mi = 0; mi < scene.meshes.size(); ++mi) {
         Mesh mesh = scene.meshes[mi];
         int ni = -1;
@@ -184,6 +187,23 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
             }
             pad4(bin, 0);
         }
+        // Skinning attributes. Written only when the mesh is actually skinned and
+        // the weight count matches the render vertices, because a JOINTS_0 set of
+        // the wrong length makes the file invalid rather than merely wrong.
+        const bool skinned = !mesh.skin.empty() && mesh.skin.size() == mesh.vertices.size();
+        uint32_t joints_off = 0, weights_off = 0;
+        if (skinned) {
+            joints_off = static_cast<uint32_t>(bin.size());
+            for (const SkinVert& sv : mesh.skin) {
+                for (int k = 0; k < 4; ++k) append_u16(bin, sv.j[k]);
+            }
+            pad4(bin, 0);
+            weights_off = static_cast<uint32_t>(bin.size());
+            for (const SkinVert& sv : mesh.skin) {
+                for (int k = 0; k < 4; ++k) append_f32(bin, sv.w[k]);
+            }
+            pad4(bin, 0);
+        }
         uint32_t idx_off = static_cast<uint32_t>(bin.size());
         bool u32 = mesh.vertices.size() > 65535;
         for (uint32_t ix : mesh.indices) {
@@ -218,6 +238,15 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
             bv_uv = static_cast<int>(g["bufferViews"].size());
             g["bufferViews"].push_back(buffer_view(uv_off, mesh.vertices.size() * 8, 34962));
         }
+        int bv_joints = -1, bv_weights = -1;
+        if (skinned) {
+            bv_joints = static_cast<int>(g["bufferViews"].size());
+            g["bufferViews"].push_back(
+                buffer_view(joints_off, mesh.skin.size() * 8, 34962));
+            bv_weights = static_cast<int>(g["bufferViews"].size());
+            g["bufferViews"].push_back(
+                buffer_view(weights_off, mesh.skin.size() * 16, 34962));
+        }
         int bv_idx = static_cast<int>(g["bufferViews"].size());
         g["bufferViews"].push_back(buffer_view(idx_off, mesh.indices.size() * (u32 ? 4 : 2), 34963));
 
@@ -233,6 +262,13 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
             ac_uv = static_cast<int>(g["accessors"].size());
             g["accessors"].push_back(accessor(bv_uv, 5126, mesh.vertices.size(), "VEC2"));
         }
+        int ac_joints = -1, ac_weights = -1;
+        if (skinned) {
+            ac_joints = static_cast<int>(g["accessors"].size());
+            g["accessors"].push_back(accessor(bv_joints, 5123, mesh.skin.size(), "VEC4"));
+            ac_weights = static_cast<int>(g["accessors"].size());
+            g["accessors"].push_back(accessor(bv_weights, 5126, mesh.skin.size(), "VEC4"));
+        }
         int ac_idx = static_cast<int>(g["accessors"].size());
         g["accessors"].push_back(accessor(bv_idx, u32 ? 5125 : 5123, mesh.indices.size(), "SCALAR"));
 
@@ -243,9 +279,34 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
         // placeholder attribute here is how files ended up claiming uvs=y while
         // carrying the per-triangle ramp from mesh_sync_render.
         if (ac_uv >= 0) attrs["TEXCOORD_0"] = ac_uv;
+        if (ac_joints >= 0) {
+            attrs["JOINTS_0"] = ac_joints;
+            attrs["WEIGHTS_0"] = ac_weights;
+        }
         nlohmann::json prim = nlohmann::json::object();
         prim["attributes"] = attrs;
         prim["indices"] = ac_idx;
+        if (ac_joints >= 0) {
+            // inverseBindMatrices, one mat4 per joint, in mesh joint order.
+            const size_t nj = mesh.inv_bind.size();
+            const size_t ibm_off = static_cast<size_t>(bin.size());
+            for (size_t b = 0; b < nj; ++b) {
+                const Mat4& m = mesh.inv_bind[b];
+                for (int c = 0; c < 16; ++c) append_f32(bin, m.m[c]);
+            }
+            pad4(bin, 0);
+            const int bv_ibm = static_cast<int>(g["bufferViews"].size());
+            g["bufferViews"].push_back(buffer_view(
+                static_cast<uint32_t>(ibm_off), nj * 64, 34962));
+            const int ac_ibm = static_cast<int>(g["accessors"].size());
+            g["accessors"].push_back(accessor(bv_ibm, 5126, nj, "MAT4"));
+            mesh_skin_gltf[mi] = static_cast<int>(g["skins"].size());
+            nlohmann::json sk = nlohmann::json::object();
+            sk["name"] = mesh.name + "_skin";
+            sk["inverseBindMatrices"] = ac_ibm;
+            sk["joints"] = nlohmann::json::array();
+            g["skins"].push_back(std::move(sk));
+        }
         mesh_gltf[mi] = static_cast<int>(g["meshes"].size());
         nlohmann::json jm = nlohmann::json::object();
         jm["name"] = mesh.name;
@@ -279,6 +340,9 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
                 int gi = mesh_gltf[n.mesh];
                 g["meshes"].at(gi)["primitives"].at(0)["material"] = n.material;
             }
+            if (mesh_skin_gltf[n.mesh] >= 0) {
+                jn["skin"] = mesh_skin_gltf[n.mesh];
+            }
         }
         if (n.type == NodeType::Camera) {
             int ci = static_cast<int>(g["cameras"].size());
@@ -295,6 +359,22 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
         node_index[i] = static_cast<int>(g["nodes"].size());
         g["nodes"].push_back(std::move(jn));
         g["scenes"][0]["nodes"].push_back(node_index[i]);
+    }
+
+    // Joints can only be resolved once every node has an index, so the skin
+    // joint lists are filled here rather than during the mesh pass.
+    for (size_t i = 0; i < scene.meshes.size(); ++i) {
+        const int si = mesh_skin_gltf[i];
+        if (si < 0) continue;
+        const Mesh& m = scene.meshes[i];
+        nlohmann::json joints = nlohmann::json::array();
+        for (const int j : m.joints) {
+            if (j >= 0 && j < static_cast<int>(scene.nodes.size()) &&
+                node_index[j] >= 0) {
+                joints.push_back(node_index[j]);
+            }
+        }
+        g["skins"][si]["joints"] = std::move(joints);
     }
 
     // The scene itself carries the supersampling factor the run rendered with,

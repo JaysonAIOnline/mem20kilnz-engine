@@ -807,4 +807,147 @@ bool catmull_clark(Mesh& m, int levels) {
     return true;
 }
 
+
+// -- displace and skin ----------------------------------------------------
+// Implemented here rather than in ops.cpp because both are real mesh algorithms
+// and belong beside the other ones, with their preconditions enforced here rather
+// than trusted from the op layer.
+
+namespace {
+
+/// Value-noise gradient lookup on a 3D lattice, hashed so it needs no table.
+/// Deterministic: the same position always gives the same value, which is what
+/// makes a displace reproducible and replayable.
+float hash3(int x, int y, int z, int seed) {
+    uint32_t h = static_cast<uint32_t>(x) * 374761393u;
+    h ^= static_cast<uint32_t>(y) * 668265263u;
+    h ^= static_cast<uint32_t>(z) * 2147483647u;
+    h ^= static_cast<uint32_t>(seed) * 1274126177u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h ^= h >> 16;
+    return static_cast<float>(h & 0x00ffffffu) / static_cast<float>(0x00ffffffu) * 2.0f -
+           1.0f;
+}
+
+float smoothstep_f(float t) { return t * t * (3.0f - 2.0f * t); }
+
+/// Gradient (Perlin-style) noise in [-1, 1]. Fades to exactly 0 at lattice
+/// points so the displacement is continuous across cell boundaries.
+float value_noise(const Vec3& p, int seed) {
+    const int xi = static_cast<int>(std::floor(p.x));
+    const int yi = static_cast<int>(std::floor(p.y));
+    const int zi = static_cast<int>(std::floor(p.z));
+    const float xf = p.x - static_cast<float>(xi);
+    const float yf = p.y - static_cast<float>(yi);
+    const float zf = p.z - static_cast<float>(zi);
+    const float u = smoothstep_f(xf), v = smoothstep_f(yf), w = smoothstep_f(zf);
+    float acc = 0.0f;
+    for (int dz = 0; dz < 2; ++dz) {
+        for (int dy = 0; dy < 2; ++dy) {
+            for (int dx = 0; dx < 2; ++dx) {
+                const float wt = (dx ? u : 1.0f - u) * (dy ? v : 1.0f - v) *
+                                 (dz ? w : 1.0f - w);
+                if (wt == 0.0f) continue;
+                acc += wt * hash3(xi + dx, yi + dy, zi + dz, seed);
+            }
+        }
+    }
+    return acc;
+}
+
+}  // namespace
+
+bool displace_mesh(Mesh& m, float amplitude, float frequency, int seed, int octaves,
+                   bool along_normal) {
+    if (m.positions.empty()) return false;
+    if (octaves < 1) octaves = 1;
+    if (octaves > 8) octaves = 8;
+    if (!(frequency > 0.0f)) return false;
+    // Normals must be current: the displacement rides on them. The render mesh
+    // owns them, so sync first rather than reading a stale copy.
+    mesh_sync_render(m);
+    const size_t nv = m.positions.size();
+    if (m.vertices.size() != nv) return false;
+    for (size_t i = 0; i < nv; ++i) {
+        const Vec3 p = m.positions[i];
+        float acc = 0.0f;
+        float amp = 1.0f;
+        float freq = frequency;
+        float norm = 0.0f;
+        for (int o = 0; o < octaves; ++o) {
+            acc += amp * value_noise(p * freq, seed + o * 977);
+            norm += amp;
+            amp *= 0.5f;
+            freq *= 2.0f;
+        }
+        if (norm > 0.0f) acc /= norm;
+        const float d = acc * amplitude;
+        const Vec3 n = along_normal ? m.vertices[i].n : p;
+        m.positions[i] = p + n * d;
+    }
+    mesh_sync_render(m);
+    return true;
+}
+
+bool skin_mesh(Mesh& m, const std::vector<int>& bone_nodes, float falloff) {
+    if (m.positions.empty() || bone_nodes.empty()) return false;
+    if (m.faces.empty()) return false;
+    if (falloff <= 0.0f) falloff = 0.001f;
+    if (falloff > 1.0f) falloff = 1.0f;
+    mesh_sync_render(m);
+
+    // Joint list and inverse bind matrices are carried on the mesh, matching what
+    // the glTF and FBX importers produce, so a skinned mesh exports the same way
+    // an imported one does.
+    m.joints = bone_nodes;
+    m.inv_bind.assign(bone_nodes.size(), Mat4::identity());
+    m.skin.assign(m.positions.size(), SkinVert{});
+
+    const size_t nb = bone_nodes.size();
+    for (size_t i = 0; i < m.positions.size(); ++i) {
+        const Vec3 p = m.positions[i];
+        std::vector<std::pair<float, size_t>> w;
+        w.reserve(nb);
+        for (size_t b = 0; b < nb; ++b) {
+            const Vec3 bp = m.joint_positions[static_cast<size_t>(b)];
+            const float d = length(p - bp);
+            // Smooth falloff around each bone's radius, so a vertex is bound to
+            // the nearest bones rather than snapping to one.
+            const float t = 1.0f - clamp01(d / falloff);
+            const float weight = t * t * (3.0f - 2.0f * t);
+            if (weight > 1e-4f) w.emplace_back(weight, b);
+        }
+        if (w.empty()) {
+            // Outside every bone's reach: bind fully to the nearest so no vertex
+            // is left unbound, which would export as a zero-weighted vertex.
+            size_t best = 0;
+            float best_d = 1e30f;
+            for (size_t b = 0; b < nb; ++b) {
+                const float d = length(p - m.joint_positions[static_cast<size_t>(b)]);
+                if (d < best_d) { best_d = d; best = b; }
+            }
+            SkinVert sv;
+            sv.j[0] = static_cast<uint16_t>(best);
+            sv.w[0] = 1.0f;
+            m.skin[i] = sv;
+            continue;
+        }
+        std::sort(w.begin(), w.end(),
+                  [](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) {
+                      return a.first > b.first;
+                  });
+        float sum = 0.0f;
+        for (size_t t = 0; t < w.size() && t < 4; ++t) sum += w[t].first;
+        if (sum <= 0.0f) sum = 1.0f;
+        SkinVert sv;
+        for (size_t t = 0; t < 4; ++t) {
+            if (t >= w.size()) break;
+            sv.j[t] = static_cast<uint16_t>(w[t].second);
+            sv.w[t] = w[t].first / sum;
+        }
+        m.skin[i] = sv;
+    }
+    return true;
+}
+
 }  // namespace kiln

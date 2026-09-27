@@ -10,6 +10,7 @@ SRCS = \
   src/scene/rig.cpp \
   src/scene/mesh_ops.cpp \
   src/scene/decimate_qem.cpp \
+  src/scene/voxel.cpp \
   src/scene/rig_ops.cpp \
   src/ops/ops.cpp \
   src/agent/agent.cpp \

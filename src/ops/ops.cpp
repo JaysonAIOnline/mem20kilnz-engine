@@ -234,6 +234,31 @@ OpResult apply_op_impl(Document& doc, const nlohmann::json& op) {
                 s.selection = i;
                 return ok("created empty " + s.nodes[i].name);
             }
+            if (prims == "bone") {
+                // Bones previously only arrived by importing a rigged glTF or
+                // FBX, which left `parent`, `pose`, `ik` and `skin` unusable on a
+                // built scene and untestable without a fixture file.
+                Node n;
+                n.type = NodeType::Bone;
+                n.name = require_str(op, "name", "Bone");
+                n.translation = require_vec3(op, "translation");
+                n.rotation_deg = require_vec3(op, "rotation");
+                n.scale = require_vec3(op, "scale", {1, 1, 1});
+                n.bone_length = require_f(op, "bone_length", 0.2f);
+                int i = s.add_node(n);
+                if (op.contains("parent")) {
+                    const std::string pn = require_str(op, "parent", "");
+                    const int pi = s.find_node(pn);
+                    if (pi < 0 || static_cast<size_t>(pi) >= s.nodes.size() ||
+                        s.nodes[static_cast<size_t>(pi)].type != NodeType::Bone) {
+                        return fail("create bone: parent '" + pn + "' is not a bone node");
+                    }
+                    if (pi == i) return fail("create bone: a bone cannot be its own parent");
+                    s.nodes[i].parent = pi;
+                }
+                s.selection = i;
+                return ok("created bone " + s.nodes[i].name);
+            }
             if (mutates) doc.undo_once();
             return fail("unknown primitive '" + prims + "'");
         }
@@ -1552,6 +1577,276 @@ OpResult apply_op_impl(Document& doc, const nlohmann::json& op) {
         mesh_sync_render(*mesh);
         return ok(std::string(kind) + ": " + (want_smooth ? "smooth" : "flat") + " shading on " +
                   mesh->name);
+    }
+
+    if (kind == "displace") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("displace: no mesh selected");
+        if (mesh->positions.empty()) return fail("displace: the mesh has no vertices");
+        const float amplitude = require_f(op, "amplitude", 0.1f);
+        const float frequency = require_f(op, "frequency", 2.0f);
+        const int seed = int(require_f(op, "seed", 0.0f));
+        const int octaves = int(require_f(op, "octaves", 3.0f));
+        const bool along_normal =
+            op.contains("direction")
+                ? require_str(op, "direction", "normal") == "normal"
+                : true;
+        const size_t before = mesh->positions.size();
+        if (!(frequency > 0.0f)) {
+            return fail("displace: frequency must be greater than 0, got " +
+                        std::to_string(frequency));
+        }
+        if (octaves < 1 || octaves > 8) {
+            return fail("displace: octaves must be 1..8, got " + std::to_string(octaves));
+        }
+        if (!displace_mesh(*mesh, amplitude, frequency, seed, octaves, along_normal)) {
+            return fail("displace: could not displace " + std::to_string(before) +
+                        " verts (the render mesh is out of step with the positions)");
+        }
+        const MeshStats ms = mesh_stats(*mesh);
+        return {true,
+                "displaced " + std::to_string(before) + " verts by amplitude " +
+                    std::to_string(amplitude) + " at frequency " +
+                    std::to_string(frequency) + " (seed " + std::to_string(seed) +
+                    ", " + std::to_string(octaves) + " octaves); volume now " +
+                    std::to_string(ms.signed_volume),
+                {{"verts", ms.verts},
+                 {"faces", ms.faces},
+                 {"amplitude", amplitude},
+                 {"frequency", frequency},
+                 {"seed", seed},
+                 {"octaves", octaves},
+                 {"degenerate_faces", ms.degenerate_faces},
+                 {"non_finite_verts", ms.non_finite},
+                 {"watertight", ms.watertight() && ms.non_finite == 0},
+                 {"surface_area", ms.surface_area},
+                 {"signed_volume", ms.signed_volume}}};
+    }
+
+    if (kind == "skin") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("skin: no mesh selected");
+        if (mesh->positions.empty()) return fail("skin: the mesh has no vertices");
+        std::vector<int> bones;
+        std::string names;
+        if (op.contains("bones")) {
+            if (!op["bones"].is_array()) return fail("skin: 'bones' must be a list of node names");
+            for (const auto& b : op["bones"]) {
+                const std::string nm = b.is_string() ? b.get<std::string>() : std::string();
+                const int idx = s.find_node(nm);
+                if (idx < 0 || static_cast<size_t>(idx) >= s.nodes.size() ||
+                    s.nodes[static_cast<size_t>(idx)].type != NodeType::Bone) {
+                    return fail("skin: '" + nm + "' is not a bone node");
+                }
+                if (!names.empty()) names += ",";
+                names += nm;
+                bones.push_back(idx);
+            }
+        } else {
+            for (size_t i = 0; i < s.nodes.size(); ++i) {
+                if (s.nodes[i].type == NodeType::Bone) {
+                    bones.push_back(static_cast<int>(i));
+                    if (!names.empty()) names += ",";
+                    names += s.nodes[i].name;
+                }
+            }
+        }
+        if (bones.empty()) return fail("skin: no bones found; create bone nodes or pass 'bones'");
+        const float falloff = require_f(op, "falloff", 0.5f);
+        // Bone world positions drive the weights, so the mesh ends up skinned to
+        // the pose the rig is actually in.
+        mesh->joint_positions.clear();
+        for (const int b : bones) {
+            mesh->joint_positions.push_back(
+                transform_point(s.world_matrix(b), Vec3{0, 0, 0}));
+        }
+        if (!skin_mesh(*mesh, bones, falloff)) {
+            return fail("skin: the mesh has no geometry to bind");
+        }
+        int unbound = 0;
+        for (const SkinVert& sv : mesh->skin) {
+            float sum = 0.0f;
+            for (int k = 0; k < 4; ++k) sum += sv.w[k];
+            if (std::fabs(sum - 1.0f) > 1e-3f) ++unbound;
+        }
+        const MeshStats ms = mesh_stats(*mesh);
+        return {true,
+                "skinned " + std::to_string(ms.verts) + " verts to " +
+                    std::to_string(bones.size()) + " bones (" + names + ") with falloff " +
+                    std::to_string(falloff) +
+                    (unbound == 0 ? "" :
+                        "; WARNING " + std::to_string(unbound) + " verts have weights that "
+                        "do not sum to 1"),
+                {{"verts", ms.verts},
+                 {"bones", bones.size()},
+                 {"bone_names", names},
+                 {"falloff", falloff},
+                 {"weights_not_normalised", unbound},
+                 {"watertight", ms.watertight()}}};
+    }
+
+    if (kind == "boolean") {
+        const std::string mode = require_str(op, "mode", "union");
+        int bm = -1;
+        if (mode == "union") bm = 0;
+        else if (mode == "difference") bm = 1;
+        else if (mode == "intersect") bm = 2;
+        else {
+            return fail("boolean: unknown mode '" + mode +
+                        "'; use union, difference or intersect");
+        }
+        const int res = int(require_f(op, "resolution", 64.0f));
+        const int ai = s.selection;
+        if (ai < 0 || static_cast<size_t>(ai) >= s.nodes.size()) {
+            return fail("boolean: select the first operand");
+        }
+        const Node& an = s.nodes[ai];
+        if (an.type != NodeType::Mesh || an.mesh < 0 ||
+            static_cast<size_t>(an.mesh) >= s.meshes.size()) {
+            return fail("boolean: the selection is not a mesh");
+        }
+        const int bi = s.find_node(require_str(op, "other", ""));
+        if (bi < 0 || static_cast<size_t>(bi) >= s.nodes.size()) {
+            return fail("boolean: 'other' must name an existing node");
+        }
+        const Node& bn = s.nodes[bi];
+        if (bn.type != NodeType::Mesh || bn.mesh < 0 ||
+            static_cast<size_t>(bn.mesh) >= s.meshes.size()) {
+            return fail("boolean: 'other' is not a mesh");
+        }
+        if (bi == ai) return fail("boolean: the two operands are the same object");
+
+        // Both operands are baked to world space first. A boolean in local space
+        // gives a wrong answer for any moved or rotated operand, and moving an
+        // object is the most ordinary thing a user does.
+        Mesh wa, wb;
+        mesh_append_transformed(wa, s.meshes[an.mesh], s.world_matrix(ai));
+        mesh_append_transformed(wb, s.meshes[bn.mesh], s.world_matrix(bi));
+        wa.smooth = true;
+        wb.smooth = true;
+
+        Mesh out;
+        if (!boolean_mesh(wa, wb, out, bm, res)) {
+            return fail("boolean: the operation produced no surface. Disjoint operands "
+                        "give an empty intersection; a resolution of " +
+                        std::to_string(res) + " may also be too fine to resolve the "
+                        "overlap.");
+        }
+        s.meshes.push_back(std::move(out));
+        const int mi = static_cast<int>(s.meshes.size()) - 1;
+        Mesh* nm = &s.meshes[mi];
+        std::string base_name = s.meshes[an.mesh].name;
+        if (base_name.empty()) base_name = "Mesh";
+        Node n;
+        n.type = NodeType::Mesh;
+        n.name = base_name + "_" + mode;
+        n.mesh = mi;
+        n.material = an.material;
+        const int i = s.add_node(n);
+        s.selection = i;
+        s.edit_mode = EditMode::Object;
+        s.face_sel.clear();
+        s.edge_sel.clear();
+        s.vert_sel.clear();
+        const MeshStats ms = mesh_stats(*nm);
+        return {true,
+                "boolean " + mode + " of " + base_name + " and " + bn.name + ": " +
+                    std::to_string(ms.faces) + " faces, " +
+                    std::to_string(ms.verts) + " verts, " +
+                    (ms.watertight() && ms.non_finite == 0
+                         ? "watertight"
+                         : "NOT watertight: " + std::to_string(ms.boundary_edges) +
+                               " boundary, " + std::to_string(ms.nonmanifold_edges) +
+                               " non-manifold, " + std::to_string(ms.non_finite) +
+                               " non-finite") +
+                    ", volume " + std::to_string(ms.signed_volume) + " at resolution " +
+                    std::to_string(res),
+                {{"mode", mode},
+                 {"faces", ms.faces},
+                 {"verts", ms.verts},
+                 {"boundary_edges", ms.boundary_edges},
+                 {"nonmanifold_edges", ms.nonmanifold_edges},
+                 {"degenerate_faces", ms.degenerate_faces},
+                 {"non_finite_verts", ms.non_finite},
+                 {"watertight", ms.watertight() && ms.non_finite == 0},
+                 {"signed_volume", ms.signed_volume},
+                 {"surface_area", ms.surface_area},
+                 {"resolution", res}}};
+    }
+
+    if (kind == "remesh") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail("remesh: no mesh selected");
+        if (mesh->faces.empty()) return fail("remesh: the mesh has no faces");
+        const size_t before = mesh->faces.size();
+
+        // `target` is what a caller actually wants, so the resolution is searched
+        // rather than exposed. Face count rises monotonically with resolution, so
+        // a bisection finds the closest setting; the search is bounded to 7 steps
+        // so a large mesh cannot make this unbounded.
+        Mesh best;
+        int best_res = 0;
+        long long target = 0;
+        bool use_target = false;
+        if (op.contains("target") && op["target"].is_number()) {
+            target = static_cast<long long>(op["target"].get<float>());
+            use_target = target >= 8;
+        }
+        if (!use_target) {
+            const int res = int(require_f(op, "resolution", 48.0f));
+            if (!remesh_mesh(*mesh, best, res)) {
+                return fail("remesh: could not extract a surface at resolution " +
+                            std::to_string(res) + ". The input must be a closed surface.");
+            }
+            best_res = res;
+        } else {
+            int lo = 6, hi = 192;
+            long long best_err = -1;
+            for (int step = 0; step < 7 && lo <= hi; ++step) {
+                const int mid = (lo + hi) / 2;
+                Mesh probe;
+                if (!remesh_mesh(*mesh, probe, mid)) break;
+                best = std::move(probe);
+                best_res = mid;
+                const long long err = std::llabs(static_cast<long long>(best.faces.size()) -
+                                                 target);
+                if (best_err < 0 || err < best_err) best_err = err;
+                if (best_err == 0) break;
+                if (static_cast<long long>(best.faces.size()) < target) lo = mid + 1;
+                else hi = mid - 1;
+            }
+            if (best.faces.empty()) {
+                return fail("remesh: could not extract a surface. The input must be a "
+                            "closed surface.");
+            }
+        }
+        if (best.faces.size() < 4) return fail("remesh: extraction produced too few faces");
+        // Saved before the move: the destination is the same object, so reading
+        // the name afterwards would return the extracted mesh's empty name.
+        const std::string keep_name = mesh->name;
+        *mesh = std::move(best);
+        mesh->name = keep_name;
+        mesh_sync_render(*mesh);
+        const MeshStats ms = mesh_stats(*mesh);
+        return {true,
+                "remeshed " + std::to_string(before) + " faces to " +
+                    std::to_string(ms.faces) + " at resolution " + std::to_string(best_res) +
+                    ", " + std::to_string(ms.verts) + " verts, " +
+                    (ms.watertight() ? "watertight" : "NOT watertight: " +
+                        std::to_string(ms.boundary_edges) + " boundary and " +
+                        std::to_string(ms.nonmanifold_edges) + " non-manifold edges") +
+                    ", volume " + std::to_string(ms.signed_volume),
+                {{"faces_before", before},
+                 {"faces_after", ms.faces},
+                 {"verts", ms.verts},
+                 {"boundary_edges", ms.boundary_edges},
+                 {"nonmanifold_edges", ms.nonmanifold_edges},
+                 {"degenerate_faces", ms.degenerate_faces},
+                 {"non_finite_verts", ms.non_finite},
+                 {"watertight", ms.watertight() && ms.non_finite == 0},
+                 {"signed_volume", ms.signed_volume},
+                 {"surface_area", ms.surface_area},
+                 {"resolution", best_res}}};
     }
 
     if (kind == "decimate") {

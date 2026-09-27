@@ -134,6 +134,7 @@ inline const std::vector<std::string>& op_names() {
         // mesh conditioning
         "decimate", "shade_smooth", "shade_flat", "recalc_normals", "separate_parts", "separate_loose",
         "subsurf", "subdivide_surface", "catmull_clark", "wireframe", "shrinkwrap",
+        "boolean", "remesh", "displace", "skin",
         "symmetrize", "mirror_symmetry", "boundary", "extrude_individual",
         "rotate_verts", "scale_verts", "shear_verts",
         // animation and ik

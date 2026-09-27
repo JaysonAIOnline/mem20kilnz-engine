@@ -67,6 +67,8 @@ struct Mesh {
     std::vector<int> tri_face;
     std::vector<SkinVert> skin;
     std::vector<int> joints;
+    /// World-space bone positions matching `joints`, used when authoring weights.
+    std::vector<Vec3> joint_positions;
     std::vector<Mat4> inv_bind;
     std::vector<ShapeKey> shapes;
     std::vector<LodLevel> lods;
@@ -148,6 +150,47 @@ const char* node_type_name(NodeType t);
 const char* edit_mode_name(EditMode m);
 
 void mesh_sync_render(Mesh& m);
+
+/// Measured quality of a mesh: topology and size, so an operation can report
+/// what it produced instead of leaving the caller to export and guess.
+struct MeshStats {
+    int faces = 0;
+    int verts = 0;
+    int boundary_edges = 0;      ///< edges used by exactly one face: a hole
+    int nonmanifold_edges = 0;   ///< edges used by more than two faces
+    int degenerate_faces = 0;
+    int non_finite = 0;
+    double surface_area = 0.0;
+    double signed_volume = 0.0;
+    /// A closed surface has no boundary and no non-manifold edges.
+    bool watertight() const { return boundary_edges == 0 && nonmanifold_edges == 0; }
+};
+
+MeshStats mesh_stats(const Mesh& m);
+
+/// Move vertices along their normals by layered value noise. Deterministic for a
+/// given seed, so a displaced mesh replays byte-identically. `octaves` is 1..8.
+bool displace_mesh(Mesh& m, float amplitude, float frequency, int seed, int octaves,
+                   bool along_normal);
+
+/// Bind every vertex to up to four of `bone_nodes` with smooth falloff weights,
+/// filling `skin`, `joints` and `inv_bind` the way the importers do. A vertex
+/// beyond every bone's falloff binds fully to the nearest, so none is left
+/// unbound. `falloff` is the bone radius in world units, clamped to (0, 1].
+bool skin_mesh(Mesh& m, const std::vector<int>& bone_nodes, float falloff);
+
+/// Resample a closed mesh onto an isosurface extracted from a voxel field.
+/// `res` is the target cell count along the longest axis (clamped to 6..192).
+/// The result is closed by construction; the extracted surface sits within one
+/// cell of the input, so volume error falls as O(h^2).
+bool remesh_mesh(const Mesh& in, Mesh& out, int res);
+
+/// Boolean of two closed meshes on a shared voxel grid. `mode`: 0 union,
+/// 1 difference (a - b), 2 intersection. Both operands are sampled on one grid
+/// over the union of their bounds, so a moved or rotated operand is handled
+/// correctly. Requires closed inputs; a holed input has no well-defined inside.
+bool boolean_mesh(const Mesh& a, const Mesh& b, Mesh& out, int mode, int res);
+
 void mesh_ensure_faces(Mesh& m);
 void mesh_compact(Mesh& m, std::vector<uint32_t>* remap_out = nullptr);
 Vec3 face_normal(const Mesh& m, int fi);
