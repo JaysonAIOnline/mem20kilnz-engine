@@ -738,13 +738,32 @@ bool catmull_clark(Mesh& m, int levels) {
             const Face& f = m.faces[fi];
             const size_t nv = f.v.size();
             if (nv == 4) {
+                // A quad needs its face point. Four quads cannot tile a quad
+                // without one: without the centre, the sub-quad near edge
+                // (a, b) is (v_a, e_ab, v_b, e_da) and its closing edge
+                // (v_b, e_da) belongs to no other face, so the surface is left
+                // open along every original corner. The face point was computed
+                // all along and never used.
+                // Emitted as triangles rather than quads, fanned from the edge
+                // point, so the diagonal runs (edge point -> face point).
+                //
+                // Fanning from the first corner instead makes the diagonal
+                // (v_cur, v_nxt), and the quad on the *other* side of that
+                // original edge has the same two corners in the same order, so
+                // it picks the same diagonal. Every interior diagonal was then
+                // used by four triangles instead of two: a subdivided torus
+                // measured 576 non-manifold edges, all with face count 4,
+                // forming a cycle of the original corners. The face point is
+                // unique to its face, so a diagonal through it can never
+                // coincide with a neighbour's.
+                const uint32_t fc = face_pt[fi];
                 for (size_t i = 0; i < 4; ++i) {
-                    const uint32_t cur = f.v[i], nxt = f.v[(i + 1) % 4];
-                    const uint32_t prv = f.v[(i + 3) % 4];
+                    const uint32_t cur = f.v[i];
+                    const uint32_t nxt = f.v[(i + 1) % 4];
                     const uint32_t e_next = edge_of(cur, nxt);
-                    const uint32_t e_prev = edge_of(prv, cur);
-                    if (e_next == UINT32_MAX || e_prev == UINT32_MAX) return false;
-                    nf.push_back(Face{{v_pt[cur], e_next, v_pt[nxt], e_prev}});
+                    if (e_next == UINT32_MAX) return false;
+                    nf.push_back(Face{{v_pt[cur], e_next, fc}});
+                    nf.push_back(Face{{e_next, v_pt[nxt], fc}});
                 }
             } else if (nv == 3) {
                 // A triangle splits into three corner triangles plus a centre
