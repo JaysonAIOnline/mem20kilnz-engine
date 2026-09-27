@@ -132,7 +132,7 @@ inline const std::vector<std::string>& op_names() {
         // import / export
         "import", "import_gltf", "import_obj", "import_fbx", "export_obj",
         // mesh conditioning
-        "decimate", "recalc_normals", "separate_parts", "separate_loose",
+        "decimate", "shade_smooth", "shade_flat", "recalc_normals", "separate_parts", "separate_loose",
         "subsurf", "subdivide_surface", "catmull_clark", "wireframe", "shrinkwrap",
         "symmetrize", "mirror_symmetry", "boundary", "extrude_individual",
         "rotate_verts", "scale_verts", "shear_verts",

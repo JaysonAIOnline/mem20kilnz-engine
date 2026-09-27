@@ -240,6 +240,14 @@ OpResult apply_op_impl(Document& doc, const nlohmann::json& op) {
         Vec3 size = require_vec3(op, "size", {1, 1, 1});
         if (prim == PrimType::Plane && size.z == 1 && size.x != 1) size.z = size.x;
         Mesh mesh = make_primitive(prim, size, static_cast<int>(require_f(op, "segments", 24)));
+        // Curved primitives are smooth-shaded, flat ones are not. This is not
+        // only cosmetic: mesh_sync_render welds on (position, normal, uv), so a
+        // flat-shaded sphere cannot share a single vertex and exports as a
+        // topologically open surface -- 18% of its edges shared when measured.
+        // A sphere is smooth, and it should also be one connected mesh.
+        const bool curved = prim == PrimType::Sphere || prim == PrimType::Cylinder ||
+                            prim == PrimType::Cone || prim == PrimType::Torus;
+        mesh.smooth = curved;
         s.meshes.push_back(std::move(mesh));
         int mi = static_cast<int>(s.meshes.size()) - 1;
         Vec3 albedo = require_vec3(op, "albedo", {0.72f, 0.73f, 0.76f});
@@ -1529,6 +1537,23 @@ OpResult apply_op_impl(Document& doc, const nlohmann::json& op) {
         return ok("wrote " + path);
     }
 
+    if (kind == "shade_smooth" || kind == "shade_flat") {
+        Mesh* mesh = s.selected_mesh();
+        if (!mesh) return fail(kind + ": no mesh");
+        const bool want_smooth = (kind == "shade_smooth");
+        if (mesh->smooth == want_smooth) {
+            return ok(std::string(kind) + ": already " +
+                      (want_smooth ? "smooth" : "flat"));
+        }
+        mesh->smooth = want_smooth;
+        // Corner attributes carry per-corner normals, which would override the
+        // shading choice, so they are dropped when the mode changes.
+        mesh->corner_attr.clear();
+        mesh_sync_render(*mesh);
+        return ok(std::string(kind) + ": " + (want_smooth ? "smooth" : "flat") + " shading on " +
+                  mesh->name);
+    }
+
     if (kind == "decimate") {
         Mesh* mesh = s.selected_mesh();
         if (!mesh) return fail("decimate: no mesh");
@@ -1538,9 +1563,36 @@ OpResult apply_op_impl(Document& doc, const nlohmann::json& op) {
         float ratio = require_f(op, "ratio", 0.0f);
         if (!(ratio > 0.0f) || ratio >= 1.0f)
             return fail("decimate: ratio must be in (0, 1), got " + std::to_string(ratio));
-        if (!decimate_mesh(*mesh, ratio)) {
+        // `method` picks the algorithm. cluster is the default because it is
+        // the only one measured to preserve the surface: it keeps the mesh
+        // watertight with 0 degenerate and 0 non-manifold faces.
+        //
+        // qem is present but refuses. Three separate attempts are recorded in
+        // failures.md with their measurements; the current one hits the triangle
+        // target and is fast (0.12s at 35k faces) but the hole retriangulation
+        // builds its loop from all of a vertex's neighbours rather than the hole
+        // boundary, so it adds faces faster than collapses remove them: a
+        // 528-triangle sphere came back as 1,470 triangles, +2457% area. An
+        // earlier version tore 100-140 holes open and lost up to 93% of its
+        // volume. Refusing loudly is the honest outcome; silently returning a
+        // larger mesh would not be.
+        const std::string method = op.value("method", std::string("cluster"));
+        bool ok = false;
+        if (method == "cluster") {
+            ok = decimate_mesh(*mesh, ratio);
+        } else if (method == "qem") {
+            return fail(
+                "decimate: method 'qem' is not available. It is implemented but "
+                "does not yet meet the quality bar: measured to return a larger "
+                "mesh than it was given. Use method 'cluster', which preserves "
+                "the surface. See failures.md for the measurements.");
+        } else {
+            return fail("decimate: unknown method '" + method + "'; use cluster");
+        }
+        if (!ok) {
             if (mutates) doc.undo_once();
-            return fail("decimate: no valid collapse found at ratio " + std::to_string(ratio));
+            return fail("decimate: no valid collapse found at ratio " + std::to_string(ratio) +
+                        " (method " + method + ")");
         }
         std::string msg = "decimated " + std::to_string(before_faces) + " faces to " +
                           std::to_string(mesh->faces.size()) + ", " +

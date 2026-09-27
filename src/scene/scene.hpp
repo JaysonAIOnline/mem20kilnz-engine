@@ -213,6 +213,11 @@ bool symmetrize_mesh(Mesh& m, int axis);
 bool shrinkwrap_mesh(Mesh& m, const Mesh& target, float weight);
 bool recalc_normals(Mesh& m);
 bool decimate_mesh(Mesh& m, float ratio);
+
+/// Quadric error metric decimation. Returns false when no legal collapse
+/// remains, which is a real answer: forcing the target is what cost the previous
+/// implementation 20-79% of its volume.
+bool decimate_qem(Mesh& m, float ratio, int max_collapses);
 bool wireframe_mesh(Mesh& m, float thickness);
 bool shear_verts(Mesh& m, const std::vector<uint32_t>& verts, Vec3 axis, float factor);
 bool rotate_verts(Mesh& m, const std::vector<uint32_t>& verts, Vec3 euler_deg);
