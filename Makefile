@@ -1,5 +1,6 @@
 CXX ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wno-missing-field-initializers -I src -I third_party -MMD -MP
+LDFLAGS ?= -lassimp
 LDFLAGS ?=
 PREFIX ?= /usr/local
 
@@ -14,6 +15,7 @@ SRCS = \
   src/io/gltf.cpp \
   src/io/gltf_import.cpp \
   src/io/obj.cpp \
+  src/io/fbx_import.cpp \
   src/render/software.cpp \
   src/rpc/rpc.cpp \
   src/app.cpp \

@@ -130,7 +130,7 @@ inline const std::vector<std::string>& op_names() {
         // level of detail
         "lod",
         // import / export
-        "import", "import_gltf", "import_obj", "export_obj",
+        "import", "import_gltf", "import_obj", "import_fbx", "export_obj",
         // mesh conditioning
         "decimate", "recalc_normals", "separate_parts", "separate_loose",
         "subsurf", "subdivide_surface", "catmull_clark", "wireframe", "shrinkwrap",

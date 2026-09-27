@@ -1,5 +1,6 @@
 #include "ops.hpp"
 
+#include "../io/assimp_io.hpp"
 #include "../io/gltf.hpp"
 
 #include <algorithm>
@@ -1585,7 +1586,7 @@ OpResult apply_op_impl(Document& doc, const nlohmann::json& op) {
         return ok("separated " + std::to_string(parts.size()) + " connected pieces");
     }
 
-    if (kind == "import" || kind == "import_gltf") {
+    if (kind == "import" || kind == "import_gltf" || kind == "import_fbx") {
         std::string path = require_str(op, "path");
         if (path.empty()) return fail("import needs 'path'");
         bool replace = op.value("replace", false);
@@ -1594,6 +1595,62 @@ OpResult apply_op_impl(Document& doc, const nlohmann::json& op) {
         size_t materials_before = s.materials.size();
         GltfImportStats st;
         std::string err;
+        // FBX and the other assimp formats go through assimp; glTF keeps its
+        // own reader, which is kiln's native path and already tested.
+        // assimp must not take over formats kiln already reads natively, or the
+        // tested glTF path would be silently replaced by a second implementation.
+        // assimp also cannot read a bare .gltf (it wants the .glb container), so
+        // an explicit .gltf must stay on the native reader too.
+        static const char* const kNative[] = {".gltf", ".glb"};
+        bool native = false;
+        for (const char* ext : kNative) {
+            const std::string p = path;
+            const std::size_t d = p.rfind('.');
+            if (d != std::string::npos) {
+                std::string e = p.substr(d);
+                for (char& c : e) {
+                    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+                }
+                if (e == ext) native = true;
+            }
+        }
+        const bool assimp_path = !native && ((kind == "import_fbx") || fbx_can_read(path));
+        if (assimp_path) {
+            FbxImportStats fst = import_fbx(s, path, err);
+            if (fst.meshes == 0) {
+                // Do not fall through to the glTF reader: assimp already said
+                // why, and reporting a JSON error for a binary FBX file sent the
+                // caller looking in entirely the wrong place.
+                s.nodes.resize(nodes_before);
+                s.meshes.resize(meshes_before);
+                s.materials.resize(materials_before);
+                return fail("import failed via assimp: " +
+                            (err.empty() ? std::string("the file contains no mesh geometry")
+                                         : err));
+            }
+            {
+                if (replace) {
+                    s.next_id = 1;
+                    s.selection = -1;
+                    s.active_camera = -1;
+                }
+                nlohmann::json d = nlohmann::json::object();
+                d["nodes"] = fst.nodes;
+                d["meshes"] = fst.meshes;
+                d["materials"] = fst.materials;
+                d["faces"] = fst.faces;
+                d["vertices"] = fst.vertices;
+                d["cameras"] = fst.cameras;
+                d["lights"] = fst.lights;
+                d["reader"] = "assimp";
+                if (!fst.dropped_attributes.empty()) {
+                    d["dropped_attributes"] = fst.dropped_attributes;
+                }
+                return {true, "imported " + std::to_string(fst.meshes) + " mesh(es), " +
+                                 std::to_string(fst.vertices) + " vertices via assimp",
+                        d};
+            }
+        }
         st = import_gltf(s, path, err);
         if (!err.empty()) {
             s.nodes.resize(nodes_before);
