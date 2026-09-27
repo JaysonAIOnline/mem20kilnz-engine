@@ -12,6 +12,8 @@ struct AgentReply {
     bool ok = true;
     std::string text;
     nlohmann::json ops = nlohmann::json::array();
+    /// True when only the complete ops of a truncated list were applied.
+    bool partial = false;
 };
 
 struct AgentConfig {

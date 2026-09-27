@@ -127,6 +127,8 @@ bool m_ops(Session& s, const json& params, json& result, int& code, std::string&
     // see exactly which call in the batch went wrong.
     json applied = json::array();
     bool all_ok = true;
+    int succeeded = 0;
+    std::string failure;
     for (std::size_t i = 0; i < params.size(); ++i) {
         OpResult r = apply_op(s.doc, params[i]);
         applied.push_back(op_result_json(r.ok, r.message,
@@ -134,15 +136,29 @@ bool m_ops(Session& s, const json& params, json& result, int& code, std::string&
                                             {"op_data", r.data}}));
         if (!r.ok) {
             all_ok = false;
+            failure = r.message;
             break;
         }
+        ++succeeded;
     }
     // The message is built before the move below: argument evaluation order is
     // unspecified in C++, so reading applied.size() inside the same call that
     // moves `applied` can observe it already emptied.
-    const std::string summary = all_ok ? ("applied " + std::to_string(applied.size()) + " ops")
-                                       : "batch stopped at the first failed op";
-    result = op_result_json(all_ok, summary, {{"applied", std::move(applied)}});
+    // On failure, say how many ops landed and why the rest did not. Reporting
+    // only "stopped at the first failed op" left a caller unable to tell a
+    // no-op failure from a batch that had already changed the document.
+    const std::string summary =
+        all_ok ? ("applied " + std::to_string(applied.size()) + " ops")
+               : (std::to_string(succeeded) + " of " + std::to_string(params.size()) +
+                  " ops applied, then failed: " + failure);
+    json extra = {{"applied", std::move(applied)},
+                  {"succeeded", succeeded},
+                  {"total", static_cast<int>(params.size())}};
+    if (!all_ok) {
+        extra["partial"] = succeeded > 0;
+        extra["failure"] = failure;
+    }
+    result = op_result_json(all_ok, summary, std::move(extra));
     return true;
 }
 

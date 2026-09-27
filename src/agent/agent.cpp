@@ -146,16 +146,64 @@ std::string run_curl(const std::string& cmd) {
     return out;
 }
 
+/// Recover the complete ops from a response that was cut off mid-array.
+///
+/// A model that runs out of tokens part-way through a list has still produced
+/// valid ops before the cut. Requiring a closing bracket discarded all of them,
+/// turning a mostly-good answer into a total failure. Walk the text with a brace
+/// stack and keep every object that parses and carries an "op" key; half an op
+/// is not an op, so an unterminated one is dropped rather than guessed at.
+bool salvage_truncated_ops(const std::string& s, nlohmann::json& out) {
+    nlohmann::json kept = nlohmann::json::array();
+    std::vector<std::size_t> open;
+    bool in_string = false;
+    bool escaped = false;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+            continue;
+        }
+        if (c == '{') {
+            open.push_back(i);
+            continue;
+        }
+        if (c == '}' && !open.empty()) {
+            const std::size_t start = open.back();
+            open.pop_back();
+            try {
+                nlohmann::json one = nlohmann::json::parse(s.substr(start, i - start + 1));
+                if (one.is_object() && one.contains("op")) kept.push_back(std::move(one));
+            } catch (...) {
+            }
+        }
+    }
+    if (kept.empty()) return false;
+    out = kept;
+    return true;
+}
+
 bool extract_json_array(const std::string& s, nlohmann::json& out) {
     auto a = s.find('[');
     auto b = s.rfind(']');
-    if (a == std::string::npos || b == std::string::npos || b <= a) return false;
-    try {
-        out = nlohmann::json::parse(s.substr(a, b - a + 1));
-        return out.is_array();
-    } catch (...) {
-        return false;
+    if (a != std::string::npos && b != std::string::npos && b > a) {
+        try {
+            out = nlohmann::json::parse(s.substr(a, b - a + 1));
+            if (out.is_array()) return true;
+        } catch (...) {
+        }
     }
+    return salvage_truncated_ops(s, out);
 }
 
 AgentReply apply_and_reply(Document& doc, const nlohmann::json& ops) {
@@ -1463,6 +1511,17 @@ AgentReply interpret(const std::string& input, Document& doc, const AgentConfig&
             auto j = nlohmann::json::parse(line);
             return apply_and_reply(doc, j);
         } catch (const std::exception& e) {
+            // An op list can arrive truncated, from a model or a paste. Salvage
+            // the complete ops instead of discarding all of them over a missing
+            // bracket, and say plainly that only part of it was applied.
+            nlohmann::json salvaged;
+            if (salvage_truncated_ops(line, salvaged)) {
+                AgentReply sr = apply_and_reply(doc, salvaged);
+                sr.partial = true;
+                sr.text = std::to_string(salvaged.size()) +
+                          " complete ops recovered from a truncated list (" + e.what() + ")";
+                return sr;
+            }
             r.ok = false;
             r.text = std::string("json: ") + e.what();
             return r;

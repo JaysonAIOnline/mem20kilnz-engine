@@ -1660,9 +1660,29 @@ OpResult apply_ops(Document& doc, const nlohmann::json& ops) {
     if (!ops.is_array()) return fail("ops must be object or array");
     std::ostringstream msg;
     bool any = false;
+    int applied = 0;
     for (const auto& op : ops) {
         OpResult r = apply_op(doc, op);
-        if (!r.ok) return r;
+        if (!r.ok) {
+            // A batch that got partway through has still changed the document.
+            // Reporting only the failure made a caller throw away real work, so
+            // say how far it got and carry the count in `data`.
+            if (applied > 0) {
+                OpResult partial;
+                partial.ok = false;
+                partial.message = std::to_string(applied) + " of " +
+                                  std::to_string(ops.size()) +
+                                  " ops applied, then failed: " + r.message +
+                                  (any ? ("; applied: " + msg.str()) : std::string());
+                partial.data = nlohmann::json::object();
+                partial.data["partial"] = true;
+                partial.data["applied"] = applied;
+                partial.data["total"] = static_cast<int>(ops.size());
+                return partial;
+            }
+            return r;
+        }
+        ++applied;
         if (any) msg << "; ";
         msg << r.message;
         any = true;
