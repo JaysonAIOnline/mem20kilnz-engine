@@ -798,6 +798,11 @@ bool catmull_clark(Mesh& m, int levels) {
     m.skin.clear();
     m.joints.clear();
     m.inv_bind.clear();
+    // Catmull-Clark is a smoothing scheme, so its output is smooth-shaded, as in
+    // any DCC tool. Leaving it flat-shaded also stopped the weld: corners with
+    // per-face normals never match, so a subdivided cube exported as a triangle
+    // soup of 144 vertices where the same mesh smooth-shaded welds to 26.
+    m.smooth = true;
     mesh_sync_render(m);
     return true;
 }
