@@ -119,6 +119,11 @@ int add_mesh(Scene& s, const aiMesh* am, FbxImportStats& stats) {
     if (!has_uvs) stats.dropped_attributes.push_back("uv0 (absent in source)");
 
     std::map<std::tuple<int, int, int, int, int>, uint32_t> weld;
+    // Attributes kept per welded position, so the corner table can be filled in
+    // once the faces are known.
+    std::vector<Vec3> pos_normal;
+    std::vector<Vec2> pos_uv;
+    std::vector<char> pos_has_uv;
     auto quant = [](float x) { return static_cast<int>(std::lround(x * 10000.0f)); };
     auto add_corner = [&](unsigned vi) -> uint32_t {
         const aiVector3D& p = am->mVertices[vi];
@@ -133,19 +138,36 @@ int add_mesh(Scene& s, const aiMesh* am, FbxImportStats& stats) {
         uint32_t id = static_cast<uint32_t>(mesh.positions.size());
         mesh.positions.push_back(Vec3{p.x, p.y, p.z});
         mesh.vertices.push_back(Vertex{Vec3{p.x, p.y, p.z}, nrm, uv});
+        pos_normal.push_back(nrm);
+        pos_uv.push_back(uv);
+        pos_has_uv.push_back(has_uvs ? 1 : 0);
         weld[key] = id;
         return id;
     };
 
+    // Corner attributes are appended in lockstep with the faces, because
+    // mesh_sync_render reads three entries per face. Without them the render
+    // rebuild discards the UVs assimp just gave us.
     for (unsigned fi = 0; fi < am->mNumFaces; ++fi) {
         const aiFace& f = am->mFaces[fi];
         Face face;
+        std::vector<CornerAttr> corners;
         for (unsigned k = 0; k < f.mNumIndices; ++k) {
             if (f.mIndices[k] >= am->mNumVertices) continue;
-            face.v.push_back(add_corner(f.mIndices[k]));
+            const uint32_t id = add_corner(f.mIndices[k]);
+            face.v.push_back(id);
+            CornerAttr ca;
+            if (id < pos_normal.size()) {
+                ca.n = pos_normal[id];
+                ca.uv = pos_uv[id];
+                ca.has_uv = id < pos_has_uv.size() && pos_has_uv[id] != 0;
+                if (ca.has_uv) mesh.has_uv = true;
+            }
+            corners.push_back(ca);
         }
         if (face.v.size() >= 3) {
             mesh.faces.push_back(std::move(face));
+            for (const CornerAttr& ca : corners) mesh.corner_attr.push_back(ca);
             ++stats.faces;
         }
     }

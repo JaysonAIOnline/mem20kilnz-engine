@@ -443,7 +443,15 @@ bool read_primitive(const Doc& d, const nlohmann::json& jp, Mesh& mesh, bool& sm
         has_nrm = nrm.ok && nrm.count == pos.count;
     }
     if (has_nrm) smooth = true;
-    if (attrs.contains("TEXCOORD_0")) rep.dropped.insert("TEXCOORD_0");
+    // UVs and normals are read, not dropped: they are per-corner attributes and
+    // kiln now has somewhere to keep them.
+    Accessor uv;
+    bool has_uv = false;
+    if (attrs.contains("TEXCOORD_0") && attrs["TEXCOORD_0"].is_number_integer()) {
+        uv = read_accessor(d, attrs["TEXCOORD_0"].get<int>());
+        has_uv = uv.ok && uv.count == pos.count && uv.components >= 2;
+        if (!has_uv) rep.dropped.insert("TEXCOORD_0");
+    }
     if (attrs.contains("TANGENT")) rep.dropped.insert("TANGENT");
     if (attrs.contains("COLOR_0")) rep.dropped.insert("COLOR_0");
     if (attrs.contains("TEXCOORD_1")) rep.dropped.insert("TEXCOORD_1");
@@ -482,11 +490,34 @@ bool read_primitive(const Doc& d, const nlohmann::json& jp, Mesh& mesh, bool& sm
     }
 
     mesh.faces.reserve(tri_count);
+    mesh.corner_attr.reserve(tri_count * 3);
+    // The corner attributes are appended in lockstep with the faces, because
+    // mesh_sync_render reads them as three entries per face.
     auto push = [&](uint32_t a, uint32_t b, uint32_t c) {
         if (a >= mesh.positions.size() || b >= mesh.positions.size() || c >= mesh.positions.size())
             return;
         if (a == b || b == c || a == c) return;
         mesh.faces.push_back(Face{{a, b, c}});
+        const uint32_t tri[3] = {a, b, c};
+        for (uint32_t v : tri) {
+            CornerAttr ca;
+            if (has_nrm) {
+                const size_t o = static_cast<size_t>(v) * nrm.components;
+                if (o + 2 < nrm.v.size()) {
+                    ca.n = Vec3{static_cast<float>(nrm.v[o]), static_cast<float>(nrm.v[o + 1]),
+                                static_cast<float>(nrm.v[o + 2])};
+                }
+            }
+            if (has_uv) {
+                const size_t o = static_cast<size_t>(v) * uv.components;
+                if (o + 1 < uv.v.size()) {
+                    ca.uv = Vec2{static_cast<float>(uv.v[o]), static_cast<float>(uv.v[o + 1])};
+                    ca.has_uv = true;
+                    mesh.has_uv = true;
+                }
+            }
+            mesh.corner_attr.push_back(ca);
+        }
     };
     if (mode == kModeTriangles) {
         for (size_t i = 0; i + 2 < idx.size(); i += 3) push(idx[i], idx[i + 1], idx[i + 2]);

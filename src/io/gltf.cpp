@@ -177,11 +177,13 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
             append_f32(bin, v.n.z);
         }
         uint32_t uv_off = static_cast<uint32_t>(bin.size());
-        for (const auto& v : mesh.vertices) {
-            append_f32(bin, v.uv.x);
-            append_f32(bin, v.uv.y);
+        if (mesh.has_uv) {
+            for (const auto& v : mesh.vertices) {
+                append_f32(bin, v.uv.x);
+                append_f32(bin, v.uv.y);
+            }
+            pad4(bin, 0);
         }
-        pad4(bin, 0);
         uint32_t idx_off = static_cast<uint32_t>(bin.size());
         bool u32 = mesh.vertices.size() > 65535;
         for (uint32_t ix : mesh.indices) {
@@ -211,8 +213,11 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
         g["bufferViews"].push_back(buffer_view(pos_off, mesh.vertices.size() * 12, 34962));
         int bv_nrm = static_cast<int>(g["bufferViews"].size());
         g["bufferViews"].push_back(buffer_view(nrm_off, mesh.vertices.size() * 12, 34962));
-        int bv_uv = static_cast<int>(g["bufferViews"].size());
-        g["bufferViews"].push_back(buffer_view(uv_off, mesh.vertices.size() * 8, 34962));
+        int bv_uv = -1;
+        if (mesh.has_uv) {
+            bv_uv = static_cast<int>(g["bufferViews"].size());
+            g["bufferViews"].push_back(buffer_view(uv_off, mesh.vertices.size() * 8, 34962));
+        }
         int bv_idx = static_cast<int>(g["bufferViews"].size());
         g["bufferViews"].push_back(buffer_view(idx_off, mesh.indices.size() * (u32 ? 4 : 2), 34963));
 
@@ -223,15 +228,21 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
         g["accessors"].push_back(std::move(acp));
         int ac_nrm = static_cast<int>(g["accessors"].size());
         g["accessors"].push_back(accessor(bv_nrm, 5126, mesh.vertices.size(), "VEC3"));
-        int ac_uv = static_cast<int>(g["accessors"].size());
-        g["accessors"].push_back(accessor(bv_uv, 5126, mesh.vertices.size(), "VEC2"));
+        int ac_uv = -1;
+        if (mesh.has_uv) {
+            ac_uv = static_cast<int>(g["accessors"].size());
+            g["accessors"].push_back(accessor(bv_uv, 5126, mesh.vertices.size(), "VEC2"));
+        }
         int ac_idx = static_cast<int>(g["accessors"].size());
         g["accessors"].push_back(accessor(bv_idx, u32 ? 5125 : 5123, mesh.indices.size(), "SCALAR"));
 
         nlohmann::json attrs = nlohmann::json::object();
         attrs["POSITION"] = ac_pos;
         attrs["NORMAL"] = ac_nrm;
-        attrs["TEXCOORD_0"] = ac_uv;
+        // Only advertise a UV set when the mesh really has one. Writing a
+        // placeholder attribute here is how files ended up claiming uvs=y while
+        // carrying the per-triangle ramp from mesh_sync_render.
+        if (ac_uv >= 0) attrs["TEXCOORD_0"] = ac_uv;
         nlohmann::json prim = nlohmann::json::object();
         prim["attributes"] = attrs;
         prim["indices"] = ac_idx;

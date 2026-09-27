@@ -58,29 +58,73 @@ Vec3 face_center(const Mesh& m, int fi) {
     return c / float(f.v.size());
 }
 
+/// Rebuild the render mesh (vertices + indices) from the editable mesh.
+///
+/// Corners are **welded**: two corners share a render vertex when their
+/// position, normal and UV all match. This used to append three fresh vertices
+/// per triangle unconditionally, which made every export a triangle soup --
+/// an N-face mesh left as 3N unshared vertices, and the UV written was the
+/// per-triangle ramp (0,0), (1,0), (1,1), which is not a texture coordinate at
+/// all. Welding on the full attribute triple is what lets a UV seam or a split
+/// normal survive, because those corners no longer match and stay apart.
+///
+/// When the mesh carries no real UVs, the UV is left at zero and `has_uv` is
+/// cleared, so the exporter omits TEXCOORD_0 rather than publishing a
+/// fabricated one.
 void mesh_sync_render(Mesh& m) {
     m.vertices.clear();
     m.indices.clear();
     m.tri_face.clear();
     std::vector<Vec3> vn;
     if (m.smooth) vn = vertex_normals(m);
+
+    bool any_uv = false;
+    std::map<std::tuple<int, int, int, int, int, int, int>, uint32_t> weld;
+    auto quant = [](float x) { return static_cast<int>(std::lround(x * 10000.0f)); };
+
     for (int fi = 0; fi < static_cast<int>(m.faces.size()); ++fi) {
         const Face& f = m.faces[fi];
         if (f.v.size() < 3) continue;
-        Vec3 n = face_normal(m, fi);
+        const Vec3 fn = face_normal(m, fi);
         auto emit = [&](uint32_t ia, uint32_t ib, uint32_t ic) {
-            uint32_t base = static_cast<uint32_t>(m.vertices.size());
-            auto nn = [&](uint32_t i) { return m.smooth && i < vn.size() ? vn[i] : n; };
-            m.vertices.push_back({m.positions[ia], nn(ia), {0, 0}});
-            m.vertices.push_back({m.positions[ib], nn(ib), {1, 0}});
-            m.vertices.push_back({m.positions[ic], nn(ic), {1, 1}});
-            m.indices.push_back(base);
-            m.indices.push_back(base + 1);
-            m.indices.push_back(base + 2);
+            const uint32_t tri[3] = {ia, ib, ic};
+            for (int k = 0; k < 3; ++k) {
+                const uint32_t i = tri[k];
+                if (i >= m.positions.size()) continue;
+                Vec3 n = fn;
+                Vec2 uv{0, 0};
+                // A corner's authored attributes win over the computed ones.
+                const size_t corner = static_cast<size_t>(fi) * 3 +
+                                      (k == 2 ? 2 : (k == 0 ? 0 : 1));
+                if (corner < m.corner_attr.size()) {
+                    const CornerAttr& ca = m.corner_attr[corner];
+                    n = ca.n;
+                    uv = ca.uv;
+                    if (ca.has_uv) any_uv = true;
+                } else if (m.smooth && i < vn.size()) {
+                    n = vn[i];
+                }
+                if (uv.x != 0.0f || uv.y != 0.0f) any_uv = true;
+                const Vec3& p = m.positions[i];
+                const auto key = std::make_tuple(quant(p.x), quant(p.y), quant(p.z),
+                                                 quant(n.x), quant(n.y), quant(n.z),
+                                                 quant(uv.x) ^ quant(uv.y));
+                auto it = weld.find(key);
+                uint32_t id;
+                if (it != weld.end()) {
+                    id = it->second;
+                } else {
+                    id = static_cast<uint32_t>(m.vertices.size());
+                    m.vertices.push_back(Vertex{p, n, uv});
+                    weld[key] = id;
+                }
+                m.indices.push_back(id);
+            }
             m.tri_face.push_back(fi);
         };
         for (size_t i = 1; i + 1 < f.v.size(); ++i) emit(f.v[0], f.v[i], f.v[i + 1]);
     }
+    m.has_uv = any_uv;
 }
 
 void mesh_compact(Mesh& m, std::vector<uint32_t>* remap_out) {

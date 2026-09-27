@@ -41,6 +41,18 @@ struct ShapeKey {
     float value = 0;
 };
 
+/// Per-face-corner attributes, the standard mesh "loop" representation.
+///
+/// `positions` + `faces` are what the editing ops work on. Normals and UVs are
+/// per corner, because that is the only way a UV seam or a split normal can be
+/// expressed at all. Stored as a flat array of three entries per face, in face
+/// order, matching the triangulated fan order used by mesh_sync_render.
+struct CornerAttr {
+    Vec3 n{0, 1, 0};
+    Vec2 uv{0, 0};
+    bool has_uv = false;
+};
+
 struct LodLevel {
     std::vector<Vec3> positions;
     std::vector<Face> faces;
@@ -60,6 +72,12 @@ struct Mesh {
     std::vector<LodLevel> lods;
     int lod = 0;
     bool smooth = false;
+    /// Three entries per face. Empty means "no authored corner attributes",
+    /// in which case normals are computed and no UVs exist.
+    std::vector<CornerAttr> corner_attr;
+    /// True only when at least one corner carried a real UV. The exporter omits
+    /// TEXCOORD_0 when this is false rather than writing placeholder coordinates.
+    bool has_uv = false;
 };
 
 struct AnimKey {
