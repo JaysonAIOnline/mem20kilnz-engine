@@ -1495,11 +1495,207 @@ OpResult apply_op_impl(Document& doc, const nlohmann::json& op) {
                   std::to_string(factor));
     }
 
+    if (kind == "clip_create") {
+        const std::string name = require_str(op, "name", "Clip");
+        if (s.clip_named(name)) return fail("clip_create: a clip named '" + name + "' exists");
+        Clip c;
+        c.name = name;
+        c.fps = require_f(op, "fps", 24.0f);
+        if (!(c.fps > 0.0f)) {
+            return fail("clip_create: fps must be greater than 0, got " +
+                        std::to_string(c.fps));
+        }
+        s.clips.push_back(std::move(c));
+        s.active_clip = static_cast<int>(s.clips.size()) - 1;
+        return {true, "created clip '" + name + "' at " + std::to_string(s.clips.back().fps) +
+                         " fps and made it active",
+                {{"name", name}, {"fps", s.clips.back().fps}, {"index", s.active_clip}}};
+    }
+
+    if (kind == "clip_list") {
+        nlohmann::json list = nlohmann::json::array();
+        for (size_t i = 0; i < s.clips.size(); ++i) {
+            const Clip& c = s.clips[i];
+            nlohmann::json e = nlohmann::json::object();
+            e["name"] = c.name;
+            e["fps"] = c.fps;
+            e["tracks"] = c.track_count();
+            e["keys"] = c.key_count();
+            e["start"] = c.start();
+            e["end"] = c.end();
+            e["active"] = static_cast<int>(i) == s.active_clip;
+            list.push_back(std::move(e));
+        }
+        return {true, std::to_string(s.clips.size()) + " clips, active " +
+                         (s.active() ? s.active()->name : std::string("none")),
+                {{"clips", list},
+                 {"count", s.clips.size()},
+                 {"active_clip", s.active() ? s.active()->name : std::string("none")}}};
+    }
+
+    if (kind == "clip_set") {
+        const std::string name = require_str(op, "name", "");
+        const int idx = s.find_clip(name);
+        if (idx < 0) return fail("clip_set: no clip named '" + name + "'");
+        s.active_clip = idx;
+        return {true, "active clip is now '" + s.clips[static_cast<size_t>(idx)].name + "'",
+                {{"name", name}, {"index", idx},
+                 {"keys", s.clips[static_cast<size_t>(idx)].key_count()}}};
+    }
+
+    if (kind == "clip_delete") {
+        const std::string name = require_str(op, "name", "");
+        const int idx = s.find_clip(name);
+        if (idx < 0) return fail("clip_delete: no clip named '" + name + "'");
+        s.clips.erase(s.clips.begin() + idx);
+        if (s.active_clip >= static_cast<int>(s.clips.size())) {
+            s.active_clip = static_cast<int>(s.clips.size()) - 1;
+        }
+        if (s.active_clip < 0) s.active_clip = s.clips.empty() ? -1 : 0;
+        return {true, "deleted clip '" + name + "', " + std::to_string(s.clips.size()) +
+                         " remain",
+                {{"deleted", name}, {"remaining", s.clips.size()}}};
+    }
+
+    if (kind == "key") {
+        Clip* c = s.active();
+        if (!c) {
+            return fail("key: no active clip. Create one with clip_create first.");
+        }
+        const int ni = resolve_node(s, op);
+        if (ni < 0) return fail("key: no target node");
+        const std::string node_name = s.nodes[static_cast<size_t>(ni)].name;
+        const int frame = int(require_f(op, "frame", float(s.frame)));
+
+        // `channel` names what is being keyed. When it is absent, key whatever the
+        // op actually supplies, which keeps simple calls short.
+        std::vector<Channel> channels;
+        if (op.contains("channel")) {
+            const std::string ch = require_str(op, "channel", "location");
+            if (ch == "location" || ch == "translation") channels.push_back(Channel::Location);
+            else if (ch == "rotation") channels.push_back(Channel::Rotation);
+            else if (ch == "scale") channels.push_back(Channel::Scale);
+            else {
+                return fail("key: unknown channel '" + ch +
+                            "'; use location, rotation or scale");
+            }
+        } else {
+            if (op.contains("translation") || op.contains("location"))
+                channels.push_back(Channel::Location);
+            if (op.contains("rotation")) channels.push_back(Channel::Rotation);
+            if (op.contains("scale")) channels.push_back(Channel::Scale);
+        }
+        if (channels.empty()) {
+            return fail("key: supply a value to key, as translation, rotation or scale");
+        }
+
+        std::string mode = require_str(op, "interp", "linear");
+        Interp interp = Interp::Linear;
+        if (mode == "step") interp = Interp::Step;
+        else if (mode == "linear") interp = Interp::Linear;
+        else if (mode == "bezier" || mode == "smooth") interp = Interp::Bezier;
+        else {
+            return fail("key: unknown interpolation '" + mode +
+                        "'; use step, linear or bezier");
+        }
+
+        int written = 0;
+        int replaced = 0;
+        for (Channel ch : channels) {
+            Vec3 value{0, 0, 0};
+            if (ch == Channel::Location) value = require_vec3(op, "translation", {0, 0, 0});
+            else if (ch == Channel::Rotation) value = require_vec3(op, "rotation", {0, 0, 0});
+            else value = require_vec3(op, "scale", {1, 1, 1});
+
+            Track* t = c->track_for(node_name, ch);
+            if (!t) {
+                Track fresh;
+                fresh.node = node_name;
+                fresh.channel = ch;
+                c->tracks.push_back(std::move(fresh));
+                t = &c->tracks.back();
+            }
+            // Re-keying the same frame must overwrite, not append a duplicate:
+            // two keys on one frame make the bracket search ambiguous.
+            bool found = false;
+            for (Keyframe& k : t->keys) {
+                if (k.frame == frame) {
+                    k.value = value;
+                    k.interp = interp;
+                    found = true;
+                    ++replaced;
+                    break;
+                }
+            }
+            if (!found) {
+                Keyframe k;
+                k.frame = frame;
+                k.value = value;
+                k.interp = interp;
+                t->keys.push_back(k);
+            }
+            ++written;
+        }
+        c->sort_keys();
+        return {true,
+                "keyed " + std::to_string(written) + " channel(s) of '" + node_name +
+                    "' at frame " + std::to_string(frame) + " in clip '" + c->name + "'" +
+                    (replaced ? " (" + std::to_string(replaced) + " replaced)" : ""),
+                {{"clip", c->name},
+                 {"node", node_name},
+                 {"frame", frame},
+                 {"channels", written},
+                 {"replaced", replaced},
+                 {"keys", c->key_count()},
+                 {"interp", mode}}};
+    }
+
+    if (kind == "retarget") {
+        const std::string from = require_str(op, "clip", "");
+        const int idx = s.find_clip(from);
+        if (idx < 0) return fail("retarget: no clip named '" + from + "'");
+        Clip* c = &s.clips[static_cast<size_t>(idx)];
+        const int before = c->track_count();
+        int dropped = 0;
+        if (!retarget_clip(*c, s, &dropped)) {
+            return fail("retarget: no track of clip '" + from +
+                        "' matched a bone, or the scene has no bones");
+        }
+        return {true,
+                "retargeted '" + from + "': " + std::to_string(before - dropped) +
+                    " of " + std::to_string(before) + " tracks matched bones, " +
+                    std::to_string(dropped) + " dropped",
+                {{"clip", from},
+                 {"tracks_before", before},
+                 {"tracks_after", c->track_count()},
+                 {"dropped", dropped},
+                 {"keys", c->key_count()}}};
+    }
+
     if (kind == "frame_at" || kind == "set_frame") {
-        int f = int(require_f(op, "frame", float(s.frame)));
-        apply_frame(s, f);
-        return ok("frame " + std::to_string(s.frame) + " applied to " +
-                  std::to_string(s.keys.size()) + " keys");
+        const int f = int(require_f(op, "frame", float(s.frame)));
+        const int driven = apply_frame(s, f);
+        if (driven == 0) {
+            const Clip* c = s.active();
+            if (!c) {
+                return fail("set_frame: no active clip. Create one with "
+                            "clip_create, then key something with the key op.");
+            }
+            return fail("set_frame: clip '" + c->name + "' has no tracks to drive");
+        }
+        const Clip* c = s.active();
+        return {true,
+                "frame " + std::to_string(s.frame) + " of clip '" + c->name + "' applied to " +
+                    std::to_string(driven) + " tracks (" +
+                    std::to_string(c->key_count()) + " keys, range " +
+                    std::to_string(c->start()) + ".." + std::to_string(c->end()) + ")",
+                {{"frame", s.frame},
+                 {"clip", c->name},
+                 {"tracks", driven},
+                 {"keys", c->key_count()},
+                 {"start", c->start()},
+                 {"end", c->end()},
+                 {"fps", c->fps}}};
     }
 
     if (kind == "ik" || kind == "ik_two_bone") {

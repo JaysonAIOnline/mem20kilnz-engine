@@ -110,6 +110,15 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
     g["asset"] = nlohmann::json::object();
     g["asset"]["version"] = "2.0";
     g["asset"]["generator"] = "kiln";
+    // glTF stores animation times in seconds and says nothing about the rate they
+    // were authored at, so a 30fps clip reimported at the default 24fps came back
+    // with its keys on the wrong frames. The rate is carried in asset extras, which
+    // is the spec's designated place for tool-specific data.
+    if (!scene.clips.empty()) {
+        g["asset"]["extras"] = nlohmann::json::object();
+        const float rate = scene.clips.front().fps > 0.0f ? scene.clips.front().fps : 24.0f;
+        g["asset"]["extras"]["kiln_fps"] = rate;
+    }
     g["scene"] = 0;
     nlohmann::json sc = nlohmann::json::object();
     sc["name"] = scene.name;
@@ -140,6 +149,26 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
     }
 
     std::vector<int> mesh_gltf(scene.meshes.size(), -1);
+
+    // Hoisted out of the mesh loop so the animation pass can build samplers with
+    // the same accessors, rather than duplicating the schema here.
+    auto buffer_view = [](uint32_t off, size_t len, int target) {
+        nlohmann::json bv = nlohmann::json::object();
+        bv["buffer"] = 0;
+        bv["byteOffset"] = off;
+        bv["byteLength"] = len;
+        bv["target"] = target;
+        return bv;
+    };
+    auto accessor = [](int view, int ctype, size_t count, const char* type) {
+        nlohmann::json ac = nlohmann::json::object();
+        ac["bufferView"] = view;
+        ac["componentType"] = ctype;
+        ac["count"] = count;
+        ac["type"] = type;
+        return ac;
+    };
+
     // glTF skin index per mesh, -1 when the mesh is not skinned.
     std::vector<int> mesh_skin_gltf(scene.meshes.size(), -1);
     for (size_t mi = 0; mi < scene.meshes.size(); ++mi) {
@@ -212,22 +241,6 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
         }
         pad4(bin, 0);
 
-        auto buffer_view = [](uint32_t off, size_t len, int target) {
-            nlohmann::json bv = nlohmann::json::object();
-            bv["buffer"] = 0;
-            bv["byteOffset"] = off;
-            bv["byteLength"] = len;
-            bv["target"] = target;
-            return bv;
-        };
-        auto accessor = [](int view, int ctype, size_t count, const char* type) {
-            nlohmann::json ac = nlohmann::json::object();
-            ac["bufferView"] = view;
-            ac["componentType"] = ctype;
-            ac["count"] = count;
-            ac["type"] = type;
-            return ac;
-        };
 
         int bv_pos = static_cast<int>(g["bufferViews"].size());
         g["bufferViews"].push_back(buffer_view(pos_off, mesh.vertices.size() * 12, 34962));
@@ -359,6 +372,142 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
         node_index[i] = static_cast<int>(g["nodes"].size());
         g["nodes"].push_back(std::move(jn));
         g["scenes"][0]["nodes"].push_back(node_index[i]);
+    }
+
+    // -- animations ---------------------------------------------------------
+    //
+    // Written as glTF animation channels, one sampler per track. Times go in
+    // seconds (frame / fps) because that is what glTF specifies, and rotation
+    // tracks become quaternions because that is the only rotation form glTF
+    // accepts. CUBICSPLINE is used for bezier tracks, whose tangents are stored
+    // here as value-per-frame and have to be scaled by the time delta.
+    if (!scene.clips.empty()) {
+        g["animations"] = nlohmann::json::array();
+        auto euler_deg_to_quat = [](Vec3 d, float out[4]) {
+            const float hx = deg2rad(d.x) * 0.5f, hy = deg2rad(d.y) * 0.5f,
+                        hz = deg2rad(d.z) * 0.5f;
+            const float sx = std::sin(hx), cx = std::cos(hx);
+            const float sy = std::sin(hy), cy = std::cos(hy);
+            const float sz = std::sin(hz), cz = std::cos(hz);
+            out[0] = sx * cy * cz - cx * sy * sz;
+            out[1] = cx * sy * cz + sx * cy * sz;
+            out[2] = cx * sy * sz - sx * cy * cz;
+            out[3] = cx * cy * cz + sx * sy * sz;
+        };
+        for (const Clip& clip : scene.clips) {
+            const float fps = clip.fps > 0.0f ? clip.fps : 24.0f;
+            nlohmann::json janim = nlohmann::json::object();
+            janim["name"] = clip.name;
+            // Per-animation rate, so a file with clips at different rates survives.
+            janim["extras"] = nlohmann::json::object();
+            janim["extras"]["kiln_fps"] = fps;
+            janim["samplers"] = nlohmann::json::array();
+            janim["channels"] = nlohmann::json::array();
+            int written = 0;
+            for (const Track& t : clip.tracks) {
+                if (t.keys.size() < 2) continue;  // glTF needs at least two keys
+                // Track names are node names; resolve to a scene node index.
+                int ni = -1;
+                for (size_t q = 0; q < scene.nodes.size(); ++q) {
+                    if (scene.nodes[q].name == t.node) {
+                        ni = static_cast<int>(q);
+                        break;
+                    }
+                }
+                if (ni < 0 || node_index[static_cast<size_t>(ni)] < 0) continue;
+                const bool cubic = t.keys.front().interp == Interp::Bezier ||
+                                   t.keys.back().interp == Interp::Bezier;
+                const bool is_rot = t.channel == Channel::Rotation;
+                const int comps = is_rot ? 4 : 3;
+
+                // input: key times in seconds, required to be strictly increasing
+                const uint32_t t_off = static_cast<uint32_t>(bin.size());
+                for (const Keyframe& k : t.keys) append_f32(bin, float(k.frame) / fps);
+                pad4(bin, 0);
+                const int bv_t = static_cast<int>(g["bufferViews"].size());
+                g["bufferViews"].push_back(buffer_view(
+                    t_off, t.keys.size() * 4, 34962));
+                const int ac_t = static_cast<int>(g["accessors"].size());
+                nlohmann::json acc_t = nlohmann::json::object();
+                acc_t["bufferView"] = bv_t;
+                acc_t["componentType"] = 5126;
+                acc_t["count"] = t.keys.size();
+                acc_t["type"] = "SCALAR";
+                // glTF requires min/max on animation input samplers.
+                acc_t["min"] = nlohmann::json::array({float(t.keys.front().frame) / fps});
+                acc_t["max"] = nlohmann::json::array({float(t.keys.back().frame) / fps});
+                g["accessors"].push_back(std::move(acc_t));
+
+                // output: value, or in/value/out for CUBICSPLINE
+                const uint32_t o_off = static_cast<uint32_t>(bin.size());
+                for (std::size_t i = 0; i < t.keys.size(); ++i) {
+                    const Keyframe& k = t.keys[i];
+                    auto push = [&](Vec3 v, const Vec3& tan) {
+                        if (is_rot) {
+                            float q[4];
+                            euler_deg_to_quat(v, q);
+                            for (int c = 0; c < 4; ++c) append_f32(bin, q[c]);
+                        } else {
+                            append_f32(bin, v.x);
+                            append_f32(bin, v.y);
+                            append_f32(bin, v.z);
+                        }
+                        if (cubic) {
+                            const float dt = float(i + 1 < t.keys.size()
+                                                       ? t.keys[i + 1].frame - k.frame
+                                                       : k.frame - t.keys[i - 1].frame);
+                            if (is_rot) {
+                                float qt[4];
+                                euler_deg_to_quat(tan * dt, qt);
+                                for (int c = 0; c < 4; ++c) append_f32(bin, qt[c]);
+                            } else {
+                                append_f32(bin, tan.x * dt);
+                                append_f32(bin, tan.y * dt);
+                                append_f32(bin, tan.z * dt);
+                            }
+                        }
+                    };
+                    if (cubic) {
+                        const Vec3 in_t = k.in_tan;
+                        const Vec3 out_t = k.out_tan;
+                        push(in_t, Vec3{0, 0, 0});
+                        push(k.value, Vec3{0, 0, 0});
+                        push(out_t, Vec3{0, 0, 0});
+                    } else {
+                        push(k.value, Vec3{0, 0, 0});
+                    }
+                }
+                pad4(bin, 0);
+                const size_t olen = t.keys.size() * (cubic ? 3u : 1u) * comps * 4u;
+                const int bv_o = static_cast<int>(g["bufferViews"].size());
+                g["bufferViews"].push_back(buffer_view(o_off, olen, 34962));
+                const int ac_o = static_cast<int>(g["accessors"].size());
+                g["accessors"].push_back(
+                    accessor(bv_o, 5126, t.keys.size() * (cubic ? 3u : 1u),
+                             is_rot ? "VEC4" : "VEC3"));
+
+                nlohmann::json smp = nlohmann::json::object();
+                smp["input"] = ac_t;
+                smp["output"] = ac_o;
+                smp["interpolation"] = cubic ? "CUBICSPLINE" : (t.keys.front().interp ==
+                                                               Interp::Step ? "STEP"
+                                                                            : "LINEAR");
+                const int si = static_cast<int>(janim["samplers"].size());
+                janim["samplers"].push_back(std::move(smp));
+                nlohmann::json ch = nlohmann::json::object();
+                ch["sampler"] = si;
+                ch["target"] = nlohmann::json::object();
+                ch["target"]["node"] = node_index[static_cast<size_t>(ni)];
+                ch["target"]["path"] = is_rot ? "rotation"
+                                              : (t.channel == Channel::Scale ? "scale"
+                                                                          : "translation");
+                janim["channels"].push_back(std::move(ch));
+                ++written;
+            }
+            if (written == 0) continue;  // do not emit an animation with no channels
+            g["animations"].push_back(std::move(janim));
+        }
+        if (g["animations"].empty()) g["animations"] = nlohmann::json::array();
     }
 
     // Joints can only be resolved once every node has an index, so the skin

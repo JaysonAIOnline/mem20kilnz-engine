@@ -312,6 +312,36 @@ nlohmann::json scene_to_json(const Scene& s) {
     j["edit_mode"] = edit_mode_name(s.edit_mode);
     j["face_sel"] = s.face_sel;
     j["vert_sel"] = s.vert_sel;
+    // Clips are serialized so a journal can replay a build that animated
+    // something. They were not before, which meant a replay silently produced a
+    // static scene even though every op had been recorded.
+    j["frame"] = s.frame;
+    j["active_clip"] = s.active_clip;
+    j["clips"] = nlohmann::json::array();
+    for (const Clip& c : s.clips) {
+        nlohmann::json jc = nlohmann::json::object();
+        jc["name"] = c.name;
+        jc["fps"] = c.fps;
+        jc["tracks"] = nlohmann::json::array();
+        for (const Track& t : c.tracks) {
+            nlohmann::json jt = nlohmann::json::object();
+            jt["node"] = t.node;
+            jt["channel"] = static_cast<int>(t.channel);
+            jt["keys"] = nlohmann::json::array();
+            for (const Keyframe& k : t.keys) {
+                nlohmann::json jk = nlohmann::json::object();
+                jk["frame"] = k.frame;
+                jk["value"] = nlohmann::json::array({k.value.x, k.value.y, k.value.z});
+                jk["interp"] = static_cast<int>(k.interp);
+                jk["in_tan"] = nlohmann::json::array({k.in_tan.x, k.in_tan.y, k.in_tan.z});
+                jk["out_tan"] =
+                    nlohmann::json::array({k.out_tan.x, k.out_tan.y, k.out_tan.z});
+                jt["keys"].push_back(std::move(jk));
+            }
+            jc["tracks"].push_back(std::move(jt));
+        }
+        j["clips"].push_back(std::move(jc));
+    }
     j["edge_sel"] = nlohmann::json::array();
     for (auto e : s.edge_sel) {
         nlohmann::json je = nlohmann::json::array();
@@ -478,6 +508,42 @@ bool scene_from_json(const nlohmann::json& j, Scene& s) {
             }
             mesh_ensure_faces(mesh);
             s.meshes.push_back(std::move(mesh));
+        }
+    }
+    // Read clips back. Without this a replay of a journal that contained a clip
+    // produced a static scene.
+    if (j.contains("clips") && j["clips"].is_array()) {
+        s.clips.clear();
+        for (const auto& jc : j["clips"]) {
+            Clip c;
+            c.name = jc.value("name", "Clip");
+            c.fps = jc.value("fps", 24.0f);
+            if (!(c.fps > 0.0f)) c.fps = 24.0f;
+            if (jc.contains("tracks") && jc["tracks"].is_array()) {
+                for (const auto& jt : jc["tracks"]) {
+                    Track t;
+                    t.node = jt.value("node", "");
+                    t.channel = static_cast<Channel>(jt.value("channel", 0));
+                    if (jt.contains("keys") && jt["keys"].is_array()) {
+                        for (const auto& jk : jt["keys"]) {
+                            Keyframe k;
+                            k.frame = jk.value("frame", 1);
+                            if (jk.contains("value")) k.value = vec3_from(jk["value"]);
+                            k.interp = static_cast<Interp>(jk.value("interp", 1));
+                            if (jk.contains("in_tan")) k.in_tan = vec3_from(jk["in_tan"]);
+                            if (jk.contains("out_tan")) k.out_tan = vec3_from(jk["out_tan"]);
+                            t.keys.push_back(k);
+                        }
+                    }
+                    if (!t.node.empty() && !t.keys.empty()) c.tracks.push_back(std::move(t));
+                }
+            }
+            c.sort_keys();
+            s.clips.push_back(std::move(c));
+        }
+        s.active_clip = j.value("active_clip", s.clips.empty() ? -1 : 0);
+        if (s.active_clip >= static_cast<int>(s.clips.size())) {
+            s.active_clip = s.clips.empty() ? -1 : 0;
         }
     }
     if (j.contains("nodes")) {

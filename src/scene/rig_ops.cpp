@@ -33,40 +33,6 @@ bool aim_bone(Scene& s, int bone, Vec3 world_dir) {
 
 }  // namespace
 
-void apply_frame(Scene& s, int frame) {
-    s.frame = frame;
-    std::map<int, std::vector<const AnimKey*>> by_frame;
-    for (const AnimKey& k : s.keys) by_frame[k.frame].push_back(&k);
-
-    for (Node& n : s.nodes) {
-        if (n.type != NodeType::Bone) continue;
-        std::vector<const AnimKey*> mine;
-        for (const auto& kv : by_frame)
-            for (const AnimKey* k : kv.second)
-                if (k->node == n.name) mine.push_back(k);
-        if (mine.empty()) {
-            n.pose_rot = {0, 0, 0};
-            n.pose_loc = {0, 0, 0};
-            continue;
-        }
-        std::sort(mine.begin(), mine.end(),
-                  [](const AnimKey* a, const AnimKey* b) { return a->frame < b->frame; });
-        const AnimKey* lo = nullptr;
-        const AnimKey* hi = nullptr;
-        for (const AnimKey* k : mine) {
-            if (k->frame <= frame) lo = k;
-            if (k->frame >= frame && !hi) hi = k;
-        }
-        if (!lo) lo = mine.front();
-        if (!hi) hi = mine.back();
-        float t = 0.0f;
-        if (hi->frame > lo->frame)
-            t = float(frame - lo->frame) / float(hi->frame - lo->frame);
-        t = std::max(0.0f, std::min(1.0f, t));
-        n.pose_rot = lerp(lo->pose_rot, hi->pose_rot, t);
-        n.pose_loc = lerp(lo->pose_loc, hi->pose_loc, t);
-    }
-}
 
 bool ik_two_bone(Scene& s, int tip, Vec3 target_world) {
     if (tip < 0 || tip >= static_cast<int>(s.nodes.size())) return false;

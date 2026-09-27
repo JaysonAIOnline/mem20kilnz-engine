@@ -566,6 +566,16 @@ bool read_primitive(const Doc& d, const nlohmann::json& jp, Mesh& mesh, bool& sm
 
 }  // namespace
 
+namespace {
+/// Index of a clip by name, or -1. Used so a re-import does not duplicate.
+int s_find_clip(const Scene& s, const std::string& n) {
+    for (size_t i = 0; i < s.clips.size(); ++i) {
+        if (s.clips[i].name == n) return static_cast<int>(i);
+    }
+    return -1;
+}
+}  // namespace
+
 GltfImportStats import_gltf(Scene& scene, const std::string& path, std::string& err) {
     GltfImportStats stats;
     Doc d;
@@ -811,6 +821,142 @@ GltfImportStats import_gltf(Scene& scene, const std::string& path, std::string& 
             }
         }
     }
+
+    // -- animations ---------------------------------------------------------
+    //
+    // Read back into clips so a file written by this exporter round-trips. Times
+    // are seconds and are converted to frames using the rate, which is taken from
+    // the glTF asset extras when present and otherwise assumed 24fps. CUBICSPLINE
+    // tangents arrive pre-multiplied by their time delta, so they are divided back
+    // out to recover the value-per-frame slopes the rest of the kernel uses.
+    {
+        float fps = 24.0f;
+        if (d.g.contains("asset") && d.g["asset"].contains("extras")) {
+            const auto& ex = d.g["asset"]["extras"];
+            if (ex.contains("kiln_fps")) fps = ex.value("kiln_fps", 24.0f);
+        }
+        if (!(fps > 0.0f)) fps = 24.0f;
+
+        // node_slot, built by the node walk above, maps a glTF node index to the
+        // scene node it became, so a channel target resolves to a real node.
+        const std::vector<int>& node_map = node_slot;
+
+        if (d.g.contains("animations") && d.g["animations"].is_array()) {
+            for (const auto& ja : d.g["animations"]) {
+                Clip clip;
+                clip.name = jstr(ja, "name", "Clip");
+                // A per-animation rate wins over the file-level default.
+                if (ja.contains("extras") && ja["extras"].contains("kiln_fps")) {
+                    const float r = ja["extras"].value("kiln_fps", fps);
+                    if (r > 0.0f) fps = r;
+                }
+                clip.fps = fps;
+                bool usable = false;
+                if (ja.contains("channels") && ja["channels"].is_array() &&
+                    ja.contains("samplers") && ja["samplers"].is_array()) {
+                    for (const auto& jch : ja["channels"]) {
+                        if (!jch.contains("target")) continue;
+                        const auto& jt = jch["target"];
+                        const int gnode = jint(jt, "node", -1);
+                        if (gnode < 0 || gnode >= static_cast<int>(node_map.size())) continue;
+                        const int scene_node = node_map[static_cast<size_t>(gnode)];
+                        if (scene_node < 0 ||
+                            scene_node >= static_cast<int>(scene.nodes.size())) {
+                            continue;
+                        }
+                        const int si = jint(jch, "sampler", -1);
+                        if (si < 0 || si >= static_cast<int>(ja["samplers"].size())) continue;
+                        const auto& js = ja["samplers"][static_cast<size_t>(si)];
+                        const int in_acc = jint(js, "input", -1);
+                        const int out_acc = jint(js, "output", -1);
+                        if (in_acc < 0 || out_acc < 0) continue;
+                        const Accessor ia = read_accessor(d, in_acc);
+                        const Accessor oa = read_accessor(d, out_acc);
+                        if (!ia.ok || !oa.ok || ia.count == 0) continue;
+                        const std::string interp = jstr(js, "interpolation", "LINEAR");
+                        const bool cubic = interp == "CUBICSPLINE";
+                        const size_t stride = cubic ? 3 : 1;
+
+                        const std::string path = jstr(jt, "path", "translation");
+                        Channel ch = Channel::Location;
+                        if (path == "rotation") ch = Channel::Rotation;
+                        else if (path == "scale") ch = Channel::Scale;
+                        else if (path != "translation") continue;  // weights/morph ignored
+
+                        Track track;
+                        track.node = scene.nodes[static_cast<size_t>(scene_node)].name;
+                        track.channel = ch;
+                        for (size_t k = 0; k < ia.count; ++k) {
+                            const float secs = acc_f(ia, k, 0, false);
+                            Keyframe kf;
+                            kf.frame = static_cast<int>(std::lround(secs * fps));
+                            if (k < oa.count / stride) {
+                                // CUBICSPLINE stores in/value/out per key, so the
+                                // value is the middle of the triplet; LINEAR and STEP
+                                // store one value per key. Reading k*stride+1 for a
+                                // non-cubic sampler walked a key ahead and read
+                                // nothing at all past the end.
+                                const size_t o = cubic ? k * 3 + 1 : k;
+                                if (ch == Channel::Rotation) {
+                                    const float qx = acc_f(oa, o, 0, false);
+                                    const float qy = acc_f(oa, o, 1, false);
+                                    const float qz = acc_f(oa, o, 2, false);
+                                    const float qw = acc_f(oa, o, 3, false);
+                                    kf.value = mat_to_euler_xyz(
+                                        quat_to_mat(qx, qy, qz, qw));
+                                } else {
+                                    kf.value = {acc_f(oa, o, 0, false), acc_f(oa, o, 1, false),
+                                                acc_f(oa, o, 2, false)};
+                                }
+                            }
+                            kf.interp = cubic ? Interp::Bezier
+                                              : (interp == "STEP" ? Interp::Step
+                                                                   : Interp::Linear);
+                            // Convert the pre-multiplied glTF tangents back to
+                            // value-per-frame so evaluation matches the exporter.
+                            if (cubic && k + 1 < ia.count) {
+                                const float dt = acc_f(ia, k + 1, 0, false) - secs;
+                                if (dt > 1e-6f) {
+                                    const size_t tin = k * stride;
+                                    const size_t tout = k * stride + 2;
+                                    auto read_tan = [&](size_t idx) {
+                                        if (ch == Channel::Rotation) {
+                                            const float qx = acc_f(oa, idx, 0, false);
+                                            const float qy = acc_f(oa, idx, 1, false);
+                                            const float qz = acc_f(oa, idx, 2, false);
+                                            const float qw = acc_f(oa, idx, 3, false);
+                                            return mat_to_euler_xyz(
+                                                quat_to_mat(qx, qy, qz, qw)) /
+                                                   dt;
+                                        }
+                                        return Vec3{acc_f(oa, idx, 0, false),
+                                                    acc_f(oa, idx, 1, false),
+                                                    acc_f(oa, idx, 2, false)} /
+                                               dt;
+                                    };
+                                    kf.in_tan = read_tan(tin);
+                                    kf.out_tan = read_tan(tout);
+                                }
+                            }
+                            track.keys.push_back(kf);
+                        }
+                        if (track.keys.size() < 2) continue;
+                        clip.tracks.push_back(std::move(track));
+                        usable = true;
+                    }
+                }
+                if (!usable) continue;
+                clip.sort_keys();
+                if (s_find_clip(scene, clip.name) < 0) {
+                    scene.clips.push_back(std::move(clip));
+                }
+            }
+            if (!scene.clips.empty() && scene.active_clip < 0) {
+                scene.active_clip = static_cast<int>(scene.clips.size()) - 1;
+            }
+        }
+    }
+
 
     stats.nodes = static_cast<int>(scene.nodes.size());
     stats.meshes = static_cast<int>(scene.meshes.size());

@@ -82,11 +82,53 @@ struct Mesh {
     bool has_uv = false;
 };
 
-struct AnimKey {
+/// How a keyframe interpolates towards the next one.
+enum class Interp { Step, Linear, Bezier };
+
+/// One channel of one node over time.
+///
+/// `in_tan` and `out_tan` are Hermite slopes in value units per frame, which is
+/// what makes them convertible to glTF CUBICSPLINE tangents without guessing. A
+/// zero slope is a corner, not a flat handle: the auto-tangent path fills them in
+/// when they are left unset, so a key that was never touched still curves.
+struct Keyframe {
     int frame = 1;
-    std::string node;
-    Vec3 pose_rot;
-    Vec3 pose_loc;
+    Vec3 value;
+    Interp interp = Interp::Linear;
+    Vec3 in_tan{0, 0, 0};
+    Vec3 out_tan{0, 0, 0};
+};
+
+/// Which transform a track drives.
+enum class Channel { Location = 0, Rotation = 1, Scale = 2 };
+
+struct Track {
+    std::string node;   ///< node name, so a clip survives a scene rebuild
+    Channel channel = Channel::Location;
+    std::vector<Keyframe> keys;
+
+    int start() const { return keys.empty() ? 1 : keys.front().frame; }
+    int end() const { return keys.empty() ? 1 : keys.back().frame; }
+};
+
+/// A named animation: a set of tracks plus a frame range and rate.
+///
+/// The previous representation was a flat list of bone poses with no name, no
+/// channels, no rate and no interpolation choice, so nothing could be authored,
+/// two clips could not coexist, and no clip could be exported.
+struct Clip {
+    std::string name;
+    float fps = 24.0f;
+    std::vector<Track> tracks;
+
+    int start() const;
+    int end() const;
+    /// Keys sorted by frame, per track, so evaluation is a bracket search.
+    void sort_keys();
+    Track* track_for(const std::string& node, Channel channel);
+    const Track* track_for(const std::string& node, Channel channel) const;
+    int track_count() const { return static_cast<int>(tracks.size()); }
+    int key_count() const;
 };
 
 struct Material {
@@ -129,7 +171,24 @@ struct Scene {
     std::vector<Edge> edge_sel;
     std::vector<uint32_t> vert_sel;
     int frame = 1;
-    std::vector<AnimKey> keys;
+    /// Animation clips. Serialized so the journal can replay a build that
+    /// animated something, which it previously could not.
+    std::vector<Clip> clips;
+    int active_clip = -1;
+
+    Clip* active() {
+        if (active_clip < 0 || active_clip >= static_cast<int>(clips.size())) return nullptr;
+        return &clips[static_cast<size_t>(active_clip)];
+    }
+    const Clip* active() const {
+        if (active_clip < 0 || active_clip >= static_cast<int>(clips.size())) return nullptr;
+        return &clips[static_cast<size_t>(active_clip)];
+    }
+    Clip* clip_named(const std::string& n);
+    /// Index of a named clip, or -1. Separate from clip_named because a null
+    /// clip is ambiguous between "absent" and "not active".
+    int find_clip(const std::string& n) const;
+    const Clip* clip_named(const std::string& n) const;
 
     int find_node(const std::string& name) const;
     int find_node_id(uint32_t id) const;
@@ -268,7 +327,25 @@ bool scale_verts(Mesh& m, const std::vector<uint32_t>& verts, Vec3 scl);
 std::vector<int> boundary_faces(const Mesh& m);
 std::vector<Mesh> separate_loose_meshes(Mesh& m);
 bool ik_two_bone(Scene& s, int tip, Vec3 target_world);
-void apply_frame(Scene& s, int frame);
+/// Evaluate the active clip at `frame` and write the result onto the nodes.
+/// Returns the number of channels driven, or 0 when there is no active clip.
+int apply_frame(Scene& s, int frame);
+
+/// Evaluate `clip` at `frame` into a map of node name -> (loc, rot, scale).
+/// Separated from apply_frame so a clip can be retargeted or inspected without
+/// mutating the scene.
+struct ClipSample {
+    Vec3 location{0, 0, 0};
+    Vec3 rotation_deg{0, 0, 0};
+    Vec3 scale{1, 1, 1};
+};
+void sample_clip(const Clip& c, int frame, std::vector<std::pair<std::string, ClipSample>>& out);
+
+/// Re-map a clip's tracks onto the bones present in `target`, matching by bone
+/// name. Tracks with no counterpart are dropped and counted in `dropped_out`
+/// rather than being attached to a similar-looking bone. Returns false when the
+/// target has no bones or no track survived.
+bool retarget_clip(Clip& clip, const Scene& target, int* dropped_out);
 bool export_obj(const Scene& scene, const std::string& path, std::string& err);
 bool import_obj(Scene& scene, const std::string& path, std::string& err);
 
