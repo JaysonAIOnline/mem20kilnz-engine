@@ -258,6 +258,12 @@ nlohmann::json describe_scene(const Scene& s) {
             jn["pose"] = nlohmann::json::array({n.pose_rot.x, n.pose_rot.y, n.pose_rot.z});
             jn["parent"] = n.parent >= 0 && n.parent < int(s.nodes.size()) ? s.nodes[n.parent].name : "";
         }
+        // Parentage for every node, not just bones: a text-only agent needs to
+        // trace a part back to whatever it belongs to.
+        if (n.type != NodeType::Bone) {
+            jn["parent"] = n.parent >= 0 && n.parent < int(s.nodes.size()) ? s.nodes[n.parent].name : "";
+        }
+        jn["scale"] = nlohmann::json::array({n.scale.x, n.scale.y, n.scale.z});
         if (n.type == NodeType::Mesh && n.mesh >= 0 && n.mesh < int(s.meshes.size())) {
             const Mesh& m = s.meshes[n.mesh];
             jn["faces"] = int(m.faces.size());
@@ -265,6 +271,36 @@ nlohmann::json describe_scene(const Scene& s) {
             jn["skinned"] = !m.skin.empty();
             jn["lod"] = m.lod;
             jn["lods"] = int(m.lods.size());
+            // Measured bounds, so a caller can answer "how big is this part"
+            // without re-deriving them from the transform chain.
+            bool have = false;
+            float lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};
+            for (const Vec3& p : m.positions) {
+                const float c[3] = {p.x, p.y, p.z};
+                if (!have) {
+                    for (int k = 0; k < 3; ++k) lo[k] = hi[k] = c[k];
+                    have = true;
+                } else {
+                    for (int k = 0; k < 3; ++k) {
+                        if (c[k] < lo[k]) lo[k] = c[k];
+                        if (c[k] > hi[k]) hi[k] = c[k];
+                    }
+                }
+            }
+            jn["bounds_measured"] = have;
+            if (have) {
+                jn["local_min"] = nlohmann::json::array({lo[0], lo[1], lo[2]});
+                jn["local_max"] = nlohmann::json::array({hi[0], hi[1], hi[2]});
+            }
+            // Material, so colour and finish are available to a caller that
+            // cannot see them.
+            if (n.material >= 0 && n.material < int(s.materials.size())) {
+                const Material& mat = s.materials[n.material];
+                jn["material"] = mat.name;
+                jn["albedo"] = nlohmann::json::array({mat.albedo.x, mat.albedo.y, mat.albedo.z});
+                jn["roughness"] = mat.roughness;
+                jn["metallic"] = mat.metallic;
+            }
             jn["shapes"] = nlohmann::json::array();
             for (const auto& sh : m.shapes) {
                 nlohmann::json js = nlohmann::json::object();
