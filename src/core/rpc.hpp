@@ -136,6 +136,9 @@ inline const std::vector<std::string>& op_names() {
         "subsurf", "subdivide_surface", "catmull_clark", "wireframe", "shrinkwrap",
         "boolean", "remesh", "displace", "skin",
         "clip_create", "clip_list", "clip_set", "clip_delete", "key", "retarget",
+        "graph_create", "graph_node", "graph_set", "graph_link", "graph_unlink",
+        "graph_delete_node", "graph_info", "graph_types", "graph_evaluate",
+        "graph_delete",
         "symmetrize", "mirror_symmetry", "boundary", "extrude_individual",
         "rotate_verts", "scale_verts", "shear_verts",
         // animation and ik

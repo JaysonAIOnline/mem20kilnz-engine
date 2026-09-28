@@ -178,6 +178,44 @@ int ensure_default_sun(Scene& s) {
     return s.add_node(L);
 }
 
+namespace {
+
+/// Resolve a node reference, which may be an index or a name.
+///
+/// Accepting both matters for a non-visual agent: a name survives a graph edit
+/// that renumbers everything, and an index is convenient for generated graphs. The
+/// JSON type decides which is meant, so there is no ambiguity to explain.
+int resolve_graph_node(const NodeGraph& g, const nlohmann::json& op) {
+    if (!op.contains("node")) return -1;
+    const auto& jn = op["node"];
+    if (jn.is_number_integer()) {
+        const int i = jn.get<int>();
+        if (i < 0 || i >= static_cast<int>(g.nodes.size())) return -1;
+        return i;
+    }
+    if (jn.is_string()) return g.find_node(jn.get<std::string>());
+    return -1;
+}
+
+std::string graph_node_error(const NodeGraph& g, const nlohmann::json& op) {
+    if (!op.contains("node")) {
+        return "no 'node' given. Pass an index or a node name.";
+    }
+    const auto& jn = op["node"];
+    std::string names;
+    for (const GraphNode& n : g.nodes) {
+        if (!names.empty()) names += ", ";
+        names += n.name;
+    }
+    if (jn.is_number_integer()) {
+        return "node index " + std::to_string(jn.get<int>()) + " is out of range. Nodes: " +
+               names;
+    }
+    return "no node named '" + jn.get<std::string>() + "'. Nodes: " + names;
+}
+
+}  // namespace
+
 OpResult apply_op_impl(Document& doc, const nlohmann::json& op) {
     if (!op.is_object() || !op.contains("op")) return fail("op object requires 'op'");
     std::string kind = op["op"].get<std::string>();
@@ -1221,7 +1259,17 @@ OpResult apply_op_impl(Document& doc, const nlohmann::json& op) {
     }
 
     if (kind == "translate") {
-        Vec3 d = require_vec3(op, "delta");
+        // Refuse rather than default to a zero delta. A missing or misspelled key
+        // used to translate by nothing and still report success, which is the worst
+        // possible answer: the caller is told the move happened and it did not.
+        if (!op.contains("delta") && !op.contains("vec")) {
+            return fail("translate: supply the movement as delta: [x, y, z]");
+        }
+        Vec3 d = op.contains("delta") ? require_vec3(op, "delta", {0, 0, 0})
+                                       : require_vec3(op, "vec", {0, 0, 0});
+        if (length(d) < 1e-9f) {
+            return fail("translate: delta is zero, so there is nothing to move");
+        }
         Mesh* mesh = s.selected_mesh();
         if (mesh && s.edit_mode != EditMode::Object) {
             std::vector<uint32_t> vs = s.vert_sel;
@@ -1493,6 +1541,353 @@ OpResult apply_op_impl(Document& doc, const nlohmann::json& op) {
         }
         return ok("sheared " + std::to_string(vs.size()) + " verts along " + ax + " by " +
                   std::to_string(factor));
+    }
+
+    if (kind == "graph_create") {
+        const std::string name = require_str(op, "name", "Graph");
+        if (s.graph_named(name)) return fail("graph_create: a graph named '" + name + "' exists");
+        NodeGraph g;
+        g.name = name;
+        s.graphs.push_back(std::move(g));
+        return {true, "created graph '" + name + "'",
+                {{"name", name}, {"index", static_cast<int>(s.graphs.size()) - 1}}};
+    }
+
+    if (kind == "graph_node") {
+        const std::string gname = require_str(op, "graph", "");
+        NodeGraph* g = s.graph_named(gname);
+        if (!g) return fail("graph_node: no graph named '" + gname + "'");
+        const std::string type = require_str(op, "type", "");
+        const std::vector<std::pair<std::string, SockValue::Type>> spec = graph_node_inputs(type);
+        if (spec.empty()) {
+            std::string known;
+            for (const std::string& t : graph_node_types()) {
+                if (!known.empty()) known += ", ";
+                known += t;
+            }
+            return fail("graph_node: unknown node type '" + type + "'. Known types: " + known);
+        }
+        GraphNode n;
+        n.type = type;
+        n.name = require_str(op, "name", type + "_" + std::to_string(g->nodes.size()));
+        if (g->find_node(n.name) >= 0) {
+            return fail("graph_node: '" + gname + "' already has a node named '" + n.name + "'");
+        }
+        n.x = int(require_f(op, "x", 0.0f));
+        n.y = int(require_f(op, "y", 0.0f));
+        // Seed every socket with the type's default, so a caller can set one value
+        // and leave the rest alone, and so describe lists the full signature.
+        for (const auto& sp : spec) {
+            SockIn sock;
+            sock.name = sp.first;
+            sock.literal = graph_socket_default(type, sp.first);
+            n.inputs.push_back(std::move(sock));
+        }
+        const int idx = static_cast<int>(g->nodes.size());
+        g->nodes.push_back(std::move(n));
+        if (type == "output" && g->output_node < 0) g->output_node = idx;
+        return {true,
+                "added '" + g->nodes[static_cast<size_t>(idx)].name + "' (" + type + ") to '" +
+                    gname + "' as node " + std::to_string(idx),
+                {{"graph", gname},
+                 {"node", g->nodes[static_cast<size_t>(idx)].name},
+                 {"index", idx},
+                 {"type", type},
+                 {"inputs", spec.size()},
+                 {"is_output", g->output_node == idx}}};
+    }
+
+    if (kind == "graph_set") {
+        const std::string gname = require_str(op, "graph", "");
+        NodeGraph* g = s.graph_named(gname);
+        if (!g) return fail("graph_set: no graph named '" + gname + "'");
+        const int ni = resolve_graph_node(*g, op);
+        if (ni < 0) return fail("graph_set: " + graph_node_error(*g, op));
+        GraphNode* n = g->node_at(ni);
+        // Named "socket" rather than "input": the Python client rewrites any field
+        // called "input" into an absolute path, because import and export use it as a
+        // filename. Passing a socket name there silently arrived as
+        // "/cwd/primitive" and no socket ever matched.
+        const std::string input = require_str(op, "socket", "");
+        SockIn* sock = nullptr;
+        for (SockIn& candidate : n->inputs) {
+            if (candidate.name == input) {
+                sock = &candidate;
+                break;
+            }
+        }
+        if (!sock) {
+            std::string known;
+            for (const SockIn& candidate : n->inputs) {
+                if (!known.empty()) known += ", ";
+                known += candidate.name;
+            }
+            return fail("graph_set: node '" + n->name + "' has no input '" + input +
+                        "'. It has: " + known);
+        }
+        // The literal is chosen by the JSON type, so a caller does not have to
+        // spell out which variant of a numeric socket it means.
+        SockValue v;
+        if (op.contains("value")) {
+            const auto& jv = op["value"];
+            if (jv.is_number()) v = SockValue::of_float(jv.get<float>());
+            else if (jv.is_string()) v = SockValue::of_string(jv.get<std::string>());
+            else if (jv.is_array() && jv.size() >= 3) {
+                v = SockValue::of_vec3({jv[0].get<float>(), jv[1].get<float>(),
+                                        jv[2].get<float>()});
+            } else {
+                return fail("graph_set: 'value' must be a number, a string, or 3 numbers");
+            }
+        } else if (op.contains("vec3")) {
+            v = SockValue::of_vec3(require_vec3(op, "vec3", {0, 0, 0}));
+        } else if (op.contains("string")) {
+            v = SockValue::of_string(require_str(op, "string", ""));
+        } else if (op.contains("number")) {
+            v = SockValue::of_float(require_f(op, "number", 0.0f));
+        } else {
+            return fail("graph_set: supply 'value', or one of vec3, string, number");
+        }
+        if (sock->linked()) sock->link_node = -1;  // an explicit value unlinks
+        sock->literal = v;
+        sock->literal_set = true;
+        return {true,
+                "set '" + n->name + "'." + input + " to " +
+                    (v.type == SockValue::Type::Vec3
+                         ? ("(" + std::to_string(v.v.x) + ", " + std::to_string(v.v.y) + ", " +
+                            std::to_string(v.v.z) + ")")
+                         : (v.type == SockValue::Type::String ? v.s
+                                                              : std::to_string(v.f))),
+                {{"graph", gname}, {"node", n->name}, {"input", input},
+                 {"linked", sock->linked()}}};
+    }
+
+    if (kind == "graph_link") {
+        const std::string gname = require_str(op, "graph", "");
+        NodeGraph* g = s.graph_named(gname);
+        if (!g) return fail("graph_link: no graph named '" + gname + "'");
+        const int to_i = resolve_graph_node(*g, op);
+        if (to_i < 0) return fail("graph_link: " + graph_node_error(*g, op));
+        const std::string from_name = require_str(op, "from", "");
+        const int from_i = g->find_node(from_name);
+        if (from_i < 0) {
+            return fail("graph_link: no node named '" + from_name + "' in '" + gname + "'");
+        }
+        if (from_i == to_i) {
+            return fail("graph_link: a node cannot be linked to itself ('" + from_name + "')");
+        }
+        GraphNode* to = g->node_at(to_i);
+        GraphNode* from = g->node_at(from_i);
+        // Named "socket" rather than "input": the Python client rewrites any field
+        // called "input" into an absolute path, because import and export use it as a
+        // filename. Passing a socket name there silently arrived as
+        // "/cwd/primitive" and no socket ever matched.
+        const std::string input = require_str(op, "socket", "");
+        SockIn* sock = nullptr;
+        for (SockIn& candidate : to->inputs) {
+            if (candidate.name == input) {
+                sock = &candidate;
+                break;
+            }
+        }
+        if (!sock) return fail("graph_link: node '" + to->name + "' has no input '" + input + "'");
+        sock->link_node = from_i;
+        sock->link_sock = int(require_f(op, "from_socket", 0.0f));
+        return {true,
+                "linked " + from->name + " -> " + to->name + "." + input,
+                {{"graph", gname}, {"from", from->name}, {"to", to->name},
+                 {"input", input}, {"socket", sock->link_sock}}};
+    }
+
+    if (kind == "graph_unlink") {
+        const std::string gname = require_str(op, "graph", "");
+        NodeGraph* g = s.graph_named(gname);
+        if (!g) return fail("graph_unlink: no graph named '" + gname + "'");
+        const int ni = resolve_graph_node(*g, op);
+        if (ni < 0) return fail("graph_unlink: " + graph_node_error(*g, op));
+        GraphNode* n = g->node_at(ni);
+        // Named "socket" rather than "input": the Python client rewrites any field
+        // called "input" into an absolute path, because import and export use it as a
+        // filename. Passing a socket name there silently arrived as
+        // "/cwd/primitive" and no socket ever matched.
+        const std::string input = require_str(op, "socket", "");
+        for (SockIn& candidate : n->inputs) {
+            if (candidate.name == input) {
+                if (!candidate.linked()) {
+                    return fail("graph_unlink: '" + n->name + "." + input +
+                                "' is not linked");
+                }
+                candidate.link_node = -1;
+                candidate.literal_set = false;
+                return {true, "unlinked " + n->name + "." + input + ", literal restored",
+                        {{"graph", gname}, {"node", n->name}, {"input", input}}};
+            }
+        }
+        return fail("graph_unlink: node '" + n->name + "' has no input '" + input + "'");
+    }
+
+    if (kind == "graph_delete_node") {
+        const std::string gname = require_str(op, "graph", "");
+        NodeGraph* g = s.graph_named(gname);
+        if (!g) return fail("graph_delete_node: no graph named '" + gname + "'");
+        const int ni = resolve_graph_node(*g, op);
+        if (ni < 0) return fail("graph_delete_node: " + graph_node_error(*g, op));
+        const std::string name = g->nodes[static_cast<size_t>(ni)].name;
+        g->nodes.erase(g->nodes.begin() + ni);
+        // Deleting shifts every later index, so links must be repaired or they
+        // silently start feeding the wrong node.
+        for (GraphNode& n : g->nodes) {
+            for (SockIn& sk : n.inputs) {
+                if (sk.link_node < 0) continue;
+                if (sk.link_node == ni) {
+                    sk.link_node = -1;
+                } else if (sk.link_node > ni) {
+                    sk.link_node -= 1;
+                }
+            }
+        }
+        if (g->output_node == ni) g->output_node = -1;
+        else if (g->output_node > ni) g->output_node -= 1;
+        return {true, "deleted '" + name + "' from '" + gname + "', links repaired",
+                {{"graph", gname}, {"deleted", name}, {"nodes", g->nodes.size()}}};
+    }
+
+    if (kind == "graph_info") {
+        const std::string gname = require_str(op, "graph", "");
+        const NodeGraph* g = s.graph_named(gname);
+        if (!g) return fail("graph_info: no graph named '" + gname + "'");
+        nlohmann::json nodes = nlohmann::json::array();
+        int link_count = 0;
+        for (size_t i = 0; i < g->nodes.size(); ++i) {
+            const GraphNode& n = g->nodes[i];
+            nlohmann::json jn = nlohmann::json::object();
+            jn["name"] = n.name;
+            jn["type"] = n.type;
+            jn["index"] = static_cast<int>(i);
+            jn["x"] = n.x;
+            jn["y"] = n.y;
+            jn["inputs"] = nlohmann::json::array();
+            for (const SockIn& sk : n.inputs) {
+                nlohmann::json js = nlohmann::json::object();
+                js["name"] = sk.name;
+                if (sk.linked()) {
+                    js["from"] = g->nodes[static_cast<size_t>(sk.link_node)].name;
+                    ++link_count;
+                } else if (sk.literal.type == SockValue::Type::Vec3) {
+                    js["value"] = nlohmann::json::array(
+                        {sk.literal.v.x, sk.literal.v.y, sk.literal.v.z});
+                } else if (sk.literal.type == SockValue::Type::String) {
+                    js["value"] = sk.literal.s;
+                } else if (sk.literal.type == SockValue::Type::Int) {
+                    js["value"] = sk.literal.i;
+                } else {
+                    js["value"] = sk.literal.f;
+                }
+                jn["inputs"].push_back(std::move(js));
+            }
+            nodes.push_back(std::move(jn));
+        }
+        return {true,
+                "'" + gname + "': " + std::to_string(g->nodes.size()) + " nodes, " +
+                    std::to_string(link_count) + " links, output " +
+                    (g->output_node >= 0 ? g->nodes[static_cast<size_t>(g->output_node)].name
+                                         : std::string("none")),
+                {{"graph", gname},
+                 {"nodes", nodes},
+                 {"node_count", g->nodes.size()},
+                 {"links", link_count},
+                 {"output_node", g->output_node >= 0
+                                      ? g->nodes[static_cast<size_t>(g->output_node)].name
+                                      : std::string("none")}}};
+    }
+
+    if (kind == "graph_types") {
+        nlohmann::json list = nlohmann::json::array();
+        for (const std::string& t : graph_node_types()) {
+            nlohmann::json jt = nlohmann::json::object();
+            jt["type"] = t;
+            nlohmann::json ins = nlohmann::json::array();
+            for (const auto& sp : graph_node_inputs(t)) {
+                nlohmann::json js = nlohmann::json::object();
+                js["name"] = sp.first;
+                switch (sp.second) {
+                    case SockValue::Type::Float: js["type"] = "float"; break;
+                    case SockValue::Type::Int: js["type"] = "int"; break;
+                    case SockValue::Type::Vec3: js["type"] = "vec3"; break;
+                    case SockValue::Type::String: js["type"] = "string"; break;
+                    case SockValue::Type::Mesh: js["type"] = "mesh"; break;
+                }
+                ins.push_back(std::move(js));
+            }
+            jt["inputs"] = std::move(ins);
+            list.push_back(std::move(jt));
+        }
+        return {true, std::to_string(list.size()) + " node types",
+                {{"types", list}}};
+    }
+
+    if (kind == "graph_evaluate") {
+        const std::string gname = require_str(op, "graph", "");
+        const NodeGraph* g = s.graph_named(gname);
+        if (!g) return fail("graph_evaluate: no graph named '" + gname + "'");
+        int forced = -1;
+        if (op.contains("node")) {
+            forced = resolve_graph_node(*g, op);
+            if (forced < 0) return fail("graph_evaluate: " + graph_node_error(*g, op));
+        }
+        const GraphResult r = evaluate_graph(*g, forced);
+        if (!r.ok) {
+            std::string msg = "graph_evaluate: " + r.error;
+            if (!r.failed_node.empty()) msg += " (at node '" + r.failed_node + "')";
+            return fail(msg);
+        }
+        const std::string out_name = require_str(op, "name", gname + "_result");
+        Mesh mesh = r.mesh;
+        mesh.name = out_name;
+        if (!mesh.name.empty()) mesh.name[0] = static_cast<char>(std::toupper(mesh.name[0]));
+        s.meshes.push_back(std::move(mesh));
+        const int mi = static_cast<int>(s.meshes.size()) - 1;
+        Node n;
+        n.type = NodeType::Mesh;
+        n.name = out_name;
+        n.mesh = mi;
+        n.material = 0;
+        const int ni = s.add_node(n);
+        s.selection = ni;
+        s.edit_mode = EditMode::Object;
+        s.face_sel.clear();
+        s.edge_sel.clear();
+        s.vert_sel.clear();
+        const MeshStats& st = r.stats;
+        return {true,
+                "graph '" + gname + "' evaluated " + std::to_string(r.nodes_evaluated) +
+                    " nodes into '" + out_name + "': " + std::to_string(st.faces) +
+                    " faces, " + std::to_string(st.verts) + " verts, " +
+                    (st.watertight() ? "watertight" : "NOT watertight: " +
+                        std::to_string(st.boundary_edges) + " boundary, " +
+                        std::to_string(st.nonmanifold_edges) + " non-manifold") +
+                    ", volume " + std::to_string(st.signed_volume),
+                {{"graph", gname},
+                 {"name", out_name},
+                 {"nodes_evaluated", r.nodes_evaluated},
+                 {"faces", st.faces},
+                 {"verts", st.verts},
+                 {"boundary_edges", st.boundary_edges},
+                 {"nonmanifold_edges", st.nonmanifold_edges},
+                 {"degenerate_faces", st.degenerate_faces},
+                 {"non_finite_verts", st.non_finite},
+                 {"watertight", st.watertight() && st.non_finite == 0},
+                 {"surface_area", st.surface_area},
+                 {"signed_volume", st.signed_volume}}};
+    }
+
+    if (kind == "graph_delete") {
+        const std::string gname = require_str(op, "graph", "");
+        const int gi = s.find_graph(gname);
+        if (gi < 0) return fail("graph_delete: no graph named '" + gname + "'");
+        s.graphs.erase(s.graphs.begin() + gi);
+        return {true, "deleted graph '" + gname + "', " + std::to_string(s.graphs.size()) +
+                         " remain",
+                {{"deleted", gname}, {"remaining", s.graphs.size()}}};
     }
 
     if (kind == "clip_create") {

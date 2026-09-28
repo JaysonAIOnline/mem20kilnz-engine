@@ -158,6 +158,63 @@ struct Node {
     float bone_length = 0.2f;
 };
 
+/// A value on a graph socket.
+///
+/// Deliberately a small explicit sum rather than a variant: a node that cannot be
+/// fed a real number has to say so, and an agent reading an error needs the type
+/// it actually wanted. Mesh sockets are the heavy case and are only populated for
+/// them.
+struct SockValue {
+    enum class Type { Float, Int, Vec3, String, Mesh };
+    Type type = Type::Float;
+    float f = 0.0f;
+    int i = 0;
+    Vec3 v{0, 0, 0};
+    std::string s;
+    Mesh mesh;
+
+    static SockValue of_float(float x) { SockValue r; r.type = Type::Float; r.f = x; return r; }
+    static SockValue of_int(int x) { SockValue r; r.type = Type::Int; r.i = x; return r; }
+    static SockValue of_vec3(Vec3 x) { SockValue r; r.type = Type::Vec3; r.v = x; return r; }
+    static SockValue of_string(std::string x) { SockValue r; r.type = Type::String; r.s = std::move(x); return r; }
+    static SockValue of_mesh(Mesh x) { SockValue r; r.type = Type::Mesh; r.mesh = std::move(x); return r; }
+};
+
+/// One input of a node instance: either a literal or a link to another node's
+/// output. A link always wins over the literal, and the literal is kept so
+/// disconnecting a link restores the previous value.
+struct SockIn {
+    std::string name;
+    SockValue literal;
+    /// True once a caller has set this literal. Needed to tell "left at its
+    /// default, so the input is simply empty" from "explicitly set to something
+    /// of the wrong type", which are different mistakes and need different
+    /// messages.
+    bool literal_set = false;
+    int link_node = -1;
+    int link_sock = 0;
+    bool linked() const { return link_node >= 0; }
+};
+
+struct GraphNode {
+    std::string type;              ///< registry key
+    std::string name;              ///< unique within the graph, for readable ops
+    std::vector<SockIn> inputs;
+    int x = 0, y = 0;              ///< layout, so a non-visual agent can place it
+};
+
+/// A procedural graph. Evaluation is demand-driven from the output node and
+/// calls the real mesh operations, so a graph produces the same geometry the
+/// equivalent op sequence would.
+struct NodeGraph {
+    std::string name;
+    std::vector<GraphNode> nodes;
+    int output_node = -1;
+    int find_node(const std::string& n) const;
+    GraphNode* node_at(int i);
+    const GraphNode* node_at(int i) const;
+};
+
 struct Scene {
     std::string name = "untitled";
     std::vector<Node> nodes;
@@ -171,6 +228,13 @@ struct Scene {
     std::vector<Edge> edge_sel;
     std::vector<uint32_t> vert_sel;
     int frame = 1;
+    /// Procedural node graphs.
+    std::vector<NodeGraph> graphs;
+
+    NodeGraph* graph_named(const std::string& n);
+    const NodeGraph* graph_named(const std::string& n) const;
+    int find_graph(const std::string& n) const;
+
     /// Animation clips. Serialized so the journal can replay a build that
     /// animated something, which it previously could not.
     std::vector<Clip> clips;
@@ -237,6 +301,30 @@ bool displace_mesh(Mesh& m, float amplitude, float frequency, int seed, int octa
 /// beyond every bone's falloff binds fully to the nearest, so none is left
 /// unbound. `falloff` is the bone radius in world units, clamped to (0, 1].
 bool skin_mesh(Mesh& m, const std::vector<int>& bone_nodes, float falloff);
+
+/// What a graph evaluation produced, with the measurements an agent needs to
+/// check it without rendering anything.
+struct GraphResult {
+    bool ok = false;
+    std::string error;      ///< empty when ok
+    std::string failed_node;///< node that failed, for a readable error
+    int nodes_evaluated = 0;
+    Mesh mesh;
+    MeshStats stats;
+};
+
+/// Names of every registered node type, for discovery.
+std::vector<std::string> graph_node_types();
+/// Input socket names and types for a node type, empty if the type is unknown.
+std::vector<std::pair<std::string, SockValue::Type>> graph_node_inputs(
+    const std::string& type);
+/// Default value for one input of a node type, so a caller can set one socket and
+/// leave the rest at their defaults.
+SockValue graph_socket_default(const std::string& type, const std::string& input);
+
+/// Evaluate `g` from its output node (or `forced_output` when >= 0).
+/// Reports the failing node and the reason rather than returning a partial mesh.
+GraphResult evaluate_graph(const NodeGraph& g, int forced_output = -1);
 
 /// Resample a closed mesh onto an isosurface extracted from a voxel field.
 /// `res` is the target cell count along the longest axis (clamped to 6..192).

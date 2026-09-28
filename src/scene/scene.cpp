@@ -317,6 +317,51 @@ nlohmann::json scene_to_json(const Scene& s) {
     // static scene even though every op had been recorded.
     j["frame"] = s.frame;
     j["active_clip"] = s.active_clip;
+    // Procedural graphs, serialized by name rather than by index. A graph's links
+    // are stored as the target node's name, so a graph survives a rebuild that
+    // renumbers nodes; storing indices would silently rewire on the next edit.
+    j["graphs"] = nlohmann::json::array();
+    for (const NodeGraph& g : s.graphs) {
+        nlohmann::json jg = nlohmann::json::object();
+        jg["name"] = g.name;
+        jg["output_node"] = g.output_node >= 0 &&
+                                    g.output_node < static_cast<int>(g.nodes.size())
+                                ? g.nodes[static_cast<size_t>(g.output_node)].name
+                                : std::string();
+        jg["nodes"] = nlohmann::json::array();
+        for (const GraphNode& n : g.nodes) {
+            nlohmann::json jn = nlohmann::json::object();
+            jn["name"] = n.name;
+            jn["type"] = n.type;
+            jn["x"] = n.x;
+            jn["y"] = n.y;
+            jn["sockets"] = nlohmann::json::array();
+            for (const SockIn& sk : n.inputs) {
+                nlohmann::json js = nlohmann::json::object();
+                js["name"] = sk.name;
+                if (sk.linked() && sk.link_node >= 0 &&
+                    sk.link_node < static_cast<int>(g.nodes.size())) {
+                    js["from"] = g.nodes[static_cast<size_t>(sk.link_node)].name;
+                    js["from_socket"] = sk.link_sock;
+                } else {
+                    js["set"] = sk.literal_set;
+                    if (sk.literal.type == SockValue::Type::Vec3) {
+                        js["value"] = nlohmann::json::array(
+                            {sk.literal.v.x, sk.literal.v.y, sk.literal.v.z});
+                    } else if (sk.literal.type == SockValue::Type::String) {
+                        js["value"] = sk.literal.s;
+                    } else if (sk.literal.type == SockValue::Type::Int) {
+                        js["value"] = sk.literal.i;
+                    } else {
+                        js["value"] = sk.literal.f;
+                    }
+                }
+                jn["sockets"].push_back(std::move(js));
+            }
+            jg["nodes"].push_back(std::move(jn));
+        }
+        j["graphs"].push_back(std::move(jg));
+    }
     j["clips"] = nlohmann::json::array();
     for (const Clip& c : s.clips) {
         nlohmann::json jc = nlohmann::json::object();
@@ -508,6 +553,73 @@ bool scene_from_json(const nlohmann::json& j, Scene& s) {
             }
             mesh_ensure_faces(mesh);
             s.meshes.push_back(std::move(mesh));
+        }
+    }
+    // Read graphs back, resolving links by name in a second pass because a node
+    // may be linked to one that has not been created yet.
+    if (j.contains("graphs") && j["graphs"].is_array()) {
+        s.graphs.clear();
+        for (const auto& jg : j["graphs"]) {
+            NodeGraph g;
+            g.name = jg.value("name", "Graph");
+            const std::string out_name = jg.value("output_node", std::string());
+            if (jg.contains("nodes") && jg["nodes"].is_array()) {
+                for (const auto& jn : jg["nodes"]) {
+                    GraphNode n;
+                    n.name = jn.value("name", "node");
+                    n.type = jn.value("type", "");
+                    n.x = jn.value("x", 0);
+                    n.y = jn.value("y", 0);
+                    for (const auto& sp : graph_node_inputs(n.type)) {
+                        SockIn sk;
+                        sk.name = sp.first;
+                        sk.literal = graph_socket_default(n.type, sp.first);
+                        n.inputs.push_back(sk);
+                    }
+                    if (jn.contains("sockets") && jn["sockets"].is_array()) {
+                        for (const auto& js : jn["sockets"]) {
+                            const std::string sn = js.value("name", "");
+                            for (SockIn& sk : n.inputs) {
+                                if (sk.name != sn) continue;
+                                if (js.contains("from")) {
+                                    // Link target is resolved by name in the second
+                                    // pass, once every node exists.
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    g.nodes.push_back(std::move(n));
+                }
+            }
+            if (!out_name.empty()) g.output_node = g.find_node(out_name);
+            s.graphs.push_back(std::move(g));
+        }
+        // Second pass for links, now that every node name is known.
+        size_t gi = 0;
+        for (const auto& jg : j["graphs"]) {
+            if (gi >= s.graphs.size()) break;
+            NodeGraph& g = s.graphs[gi++];
+            if (!(jg.contains("nodes") && jg["nodes"].is_array())) continue;
+            for (const auto& jn : jg["nodes"]) {
+                const int to_i = g.find_node(jn.value("name", ""));
+                if (to_i < 0) continue;
+                GraphNode* to = g.node_at(to_i);
+                if (!(jn.contains("sockets") && jn["sockets"].is_array())) continue;
+                for (const auto& js : jn["sockets"]) {
+                    if (!js.contains("from")) continue;
+                    const int from_i = g.find_node(js.value("from", ""));
+                    const std::string sn = js.value("name", "");
+                    if (from_i < 0) continue;
+                    for (SockIn& sk : to->inputs) {
+                        if (sk.name == sn) {
+                            sk.link_node = from_i;
+                            sk.link_sock = js.value("from_socket", 0);
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
     // Read clips back. Without this a replay of a journal that contained a clip
