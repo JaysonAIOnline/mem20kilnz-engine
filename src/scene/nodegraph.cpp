@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -369,6 +370,11 @@ bool run_node(const std::string& type, const std::vector<SockValue>& in, SockVal
         return true;
     }
 
+    if (type == "group") {
+        out = in.empty() ? SockValue{} : in[0];
+        return true;
+    }
+
     if (type == "output") {
         if (in.empty() || in[0].type != SockValue::Type::Mesh) {
             err = "output: the mesh input is empty or not a mesh. Link a node that "
@@ -387,6 +393,7 @@ bool run_node(const std::string& type, const std::vector<SockValue>& in, SockVal
 /// Demand-driven evaluation with cycle detection.
 struct Evaluator {
     const NodeGraph& g;
+    const std::vector<NodeGraph>* all;
     std::vector<SockValue> cache;
     std::vector<uint8_t> state;  // 0 unvisited, 1 in progress, 2 done
     std::vector<int> stack;
@@ -394,8 +401,66 @@ struct Evaluator {
     std::string failed;
     int count = 0;
 
-    explicit Evaluator(const NodeGraph& gr)
-        : g(gr), cache(gr.nodes.size()), state(gr.nodes.size(), 0) {}
+    Evaluator(const NodeGraph& gr, const std::vector<NodeGraph>* a)
+        : g(gr), all(a), cache(gr.nodes.size()), state(gr.nodes.size(), 0) {}
+
+    /// Evaluate an instanced graph, applying this node's parameter overrides to a
+    /// copy so the original graph is untouched.
+    bool eval_group(int idx) {
+        const GraphNode& n = g.nodes[static_cast<size_t>(idx)];
+        if (!all) {
+            error = "group '" + n.name + "': no graph set to resolve against";
+            failed = n.name;
+            return false;
+        }
+        const NodeGraph* target = nullptr;
+        for (const NodeGraph& cand : *all) {
+            if (cand.name == n.target_graph) {
+                target = &cand;
+                break;
+            }
+        }
+        if (!target) {
+            error = "group '" + n.name + "': no graph named '" + n.target_graph + "'";
+            failed = n.name;
+            return false;
+        }
+        // A copy, so an instance never mutates the graph it instantiates.
+        NodeGraph inst = *target;
+        int applied = 0;
+        for (std::size_t k = 0; k < n.inputs.size() && k < inst.params.size(); ++k) {
+            const SockIn& sock = n.inputs[k];
+            if (sock.linked()) continue;  // a wired parameter is driven by the link
+            const GraphParam& prm = inst.params[k];
+            const int ti = inst.find_node(prm.node);
+            GraphNode* tn = inst.node_at(ti);
+            if (!tn) continue;
+            for (SockIn& ts : tn->inputs) {
+                if (ts.name == prm.socket) {
+                    ts.literal = sock.literal;
+                    ts.literal_set = true;
+                    ++applied;
+                    break;
+                }
+            }
+        }
+        if (applied == 0) {
+            error = "group '" + n.name + "' overrode nothing: none of its parameters "
+                    "matched a socket in '" + inst.name + "'";
+            failed = n.name;
+            return false;
+        }
+        const GraphResult r = evaluate_graph_in(*all, inst);
+        if (!r.ok) {
+            error = "group '" + n.name + "' instantiating '" + inst.name + "': " + r.error;
+            failed = n.name;
+            return false;
+        }
+        cache[static_cast<size_t>(idx)] = SockValue::of_mesh(r.mesh);
+        state[static_cast<size_t>(idx)] = 2;
+        ++count;
+        return true;
+    }
 
     bool eval(int idx) {
         if (idx < 0 || idx >= static_cast<int>(g.nodes.size())) {
@@ -419,18 +484,30 @@ struct Evaluator {
             return false;
         }
         const GraphNode& n = g.nodes[static_cast<size_t>(idx)];
+        if (n.type == "group") {
+            return eval_group(idx);
+        }
         state[static_cast<size_t>(idx)] = 1;
         stack.push_back(idx);
 
-        const NodeDef* def = find_def(n.type);
-        if (!def) {
-            error = "unknown node type '" + n.type + "'";
-            failed = n.name;
-            return false;
+        // A group node's signature comes from the graph it instantiates rather than
+        // from the static registry.
+        std::vector<std::pair<std::string, SockValue::Type>> spec;
+        const NodeDef* def = nullptr;
+        if (n.type == "group") {
+            spec = graph_group_inputs(*all, n.target_graph);
+        } else {
+            def = find_def(n.type);
+            if (!def) {
+                error = "unknown node type '" + n.type + "'";
+                failed = n.name;
+                return false;
+            }
+            for (const SocketSpec& sp : def->inputs) spec.emplace_back(sp.name, sp.type);
         }
         std::vector<SockValue> ins;
-        ins.reserve(def->inputs.size());
-        for (size_t k = 0; k < def->inputs.size(); ++k) {
+        ins.reserve(spec.size());
+        for (size_t k = 0; k < spec.size(); ++k) {
             const SockIn* sock = nullptr;
             for (const SockIn& candidate : n.inputs) {
                 if (candidate.name == def->inputs[k].name) {
@@ -447,27 +524,37 @@ struct Evaluator {
                 got = cache[static_cast<size_t>(sock->link_node)];
             } else if (sock) {
                 got = sock->literal;
+            } else if (n.type == "group") {
+                // Unwired group parameters take the instanced graph's own default,
+                // which is what makes a group usable without setting every knob.
+                got = SockValue{};
+                const NodeGraph* tgt = nullptr;
+                if (all) {
+                    for (const NodeGraph& cand : *all) {
+                        if (cand.name == n.target_graph) tgt = &cand;
+                    }
+                }
+                if (tgt && k < tgt->params.size()) got = tgt->params[k].def;
             } else {
                 got = def->inputs[k].def;
             }
             SockValue coerced;
             std::string cerr;
-            if (def->inputs[k].type == SockValue::Type::Mesh &&
-                got.type != SockValue::Type::Mesh) {
+            if (spec[k].second == SockValue::Type::Mesh && got.type != SockValue::Type::Mesh) {
                 // Left at its default, a mesh socket is legitimately empty and the
                 // node reports that. Set to something else, it is a type error, and
                 // saying "the output node did not produce a mesh" instead would hide
                 // the actual mistake.
                 if (sock && sock->literal_set) {
-                    error = std::string("input '") + def->inputs[k].name + "': cannot use a " +
+                    error = std::string("input '") + spec[k].first + "': cannot use a " +
                             type_name(got.type) + " where a mesh is expected";
                     failed = n.name;
                     stack.pop_back();
                     return false;
                 }
                 coerced = got;
-            } else if (!coerce(got, def->inputs[k].type, coerced, cerr)) {
-                error = std::string("input '") + def->inputs[k].name + "': " + cerr;
+            } else if (!coerce(got, spec[k].second, coerced, cerr)) {
+                error = std::string("input '") + spec[k].first + "': " + cerr;
                 failed = n.name;
                 stack.pop_back();
                 return false;
@@ -491,6 +578,173 @@ struct Evaluator {
 };
 
 }  // namespace
+
+/// Serialize graphs by node and socket name rather than by index.
+///
+/// Names rather than indices, so a graph survives a rebuild that renumbers
+/// nodes; indices would silently rewire on the next edit. Shared by the undo
+/// snapshot, the json sidecar and the glTF export, so there is one format and one
+/// implementation of it.
+nlohmann::json graph_to_json(const NodeGraph& g) {
+    nlohmann::json jg = nlohmann::json::object();
+    jg["name"] = g.name;
+    jg["output_node"] = g.output_node >= 0 &&
+                                g.output_node < static_cast<int>(g.nodes.size())
+                            ? g.nodes[static_cast<size_t>(g.output_node)].name
+                            : std::string();
+    jg["nodes"] = nlohmann::json::array();
+    for (const GraphNode& n : g.nodes) {
+        nlohmann::json jn = nlohmann::json::object();
+        jn["name"] = n.name;
+        jn["type"] = n.type;
+        if (!n.target_graph.empty()) jn["target_graph"] = n.target_graph;
+        jn["x"] = n.x;
+        jn["y"] = n.y;
+        jn["sockets"] = nlohmann::json::array();
+        for (const SockIn& sk : n.inputs) {
+            nlohmann::json js = nlohmann::json::object();
+            js["name"] = sk.name;
+            if (sk.linked() && sk.link_node >= 0 &&
+                sk.link_node < static_cast<int>(g.nodes.size())) {
+                js["from"] = g.nodes[static_cast<size_t>(sk.link_node)].name;
+                js["from_socket"] = sk.link_sock;
+            } else {
+                js["set"] = sk.literal_set;
+                if (sk.literal.type == SockValue::Type::Vec3) {
+                    js["value"] = nlohmann::json::array(
+                        {sk.literal.v.x, sk.literal.v.y, sk.literal.v.z});
+                } else if (sk.literal.type == SockValue::Type::String) {
+                    js["value"] = sk.literal.s;
+                } else if (sk.literal.type == SockValue::Type::Int) {
+                    js["value"] = sk.literal.i;
+                } else {
+                    js["value"] = sk.literal.f;
+                }
+            }
+            jn["sockets"].push_back(std::move(js));
+        }
+        jg["nodes"].push_back(std::move(jn));
+    }
+    return jg;
+}
+
+
+/// Read graphs back, resolving links in a second pass because a node may be
+/// linked to one that has not been created yet.
+void graphs_from_json(const nlohmann::json& arr, std::vector<NodeGraph>& out) {
+    out.clear();
+    if (!arr.is_array()) return;
+    for (const auto& jg : arr) {
+        NodeGraph g;
+        g.name = jg.value("name", "Graph");
+        const std::string out_name = jg.value("output_node", std::string());
+        if (jg.contains("params") && jg["params"].is_array()) {
+            for (const auto& jp : jg["params"]) {
+                GraphParam prm;
+                prm.name = jp.value("name", "");
+                prm.type = static_cast<SockValue::Type>(jp.value("type", 0));
+                prm.node = jp.value("node", "");
+                prm.socket = jp.value("socket", "");
+                if (jp.contains("default")) {
+                    const auto& jd = jp["default"];
+                    if (jd.is_array() && jd.size() >= 3) {
+                        prm.def = SockValue::of_vec3(
+                            {jd[0].get<float>(), jd[1].get<float>(), jd[2].get<float>()});
+                    } else if (jd.is_string()) {
+                        prm.def = SockValue::of_string(jd.get<std::string>());
+                    } else if (jd.is_number_integer()) {
+                        prm.def = SockValue::of_int(jd.get<int>());
+                    } else {
+                        prm.def = SockValue::of_float(jd.get<float>());
+                    }
+                }
+                if (!prm.name.empty() && !prm.node.empty()) g.params.push_back(std::move(prm));
+            }
+        }
+        if (jg.contains("nodes") && jg["nodes"].is_array()) {
+            for (const auto& jn : jg["nodes"]) {
+                GraphNode n;
+                n.name = jn.value("name", "node");
+                n.type = jn.value("type", "");
+                n.target_graph = jn.value("target_graph", "");
+                n.x = jn.value("x", 0);
+                n.y = jn.value("y", 0);
+                // Sockets are seeded from the registry so a socket added by a
+                // later version still exists, then the stored values are applied.
+                for (const auto& sp : graph_node_inputs(n.type)) {
+                    SockIn sk;
+                    sk.name = sp.first;
+                    sk.literal = graph_socket_default(n.type, sp.first);
+                    n.inputs.push_back(sk);
+                }
+                if (jn.contains("sockets") && jn["sockets"].is_array()) {
+                    for (const auto& js : jn["sockets"]) {
+                        const std::string sn = js.value("name", "");
+                        for (SockIn& sk : n.inputs) {
+                            if (sk.name != sn) continue;
+                            if (js.contains("from")) {
+                                // Link target resolved by name in the second pass.
+                            } else {
+                                sk.literal_set = js.value("set", false);
+                                if (js.contains("value")) {
+                                    const auto& jv = js["value"];
+                                    if (jv.is_array() && jv.size() >= 3) {
+                                        sk.literal = SockValue::of_vec3(
+                                            {jv[0].get<float>(), jv[1].get<float>(),
+                                             jv[2].get<float>()});
+                                    } else if (jv.is_string()) {
+                                        sk.literal =
+                                            SockValue::of_string(jv.get<std::string>());
+                                    } else if (jv.is_number_integer()) {
+                                        sk.literal = SockValue::of_int(jv.get<int>());
+                                    } else {
+                                        sk.literal = SockValue::of_float(jv.get<float>());
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                g.nodes.push_back(std::move(n));
+            }
+        }
+        if (!out_name.empty()) g.output_node = g.find_node(out_name);
+        out.push_back(std::move(g));
+    }
+    // Second pass for links, now that every node name is known.
+    size_t gi = 0;
+    for (const auto& jg : arr) {
+        if (gi >= out.size()) break;
+        NodeGraph& g = out[gi++];
+        if (!(jg.contains("nodes") && jg["nodes"].is_array())) continue;
+        for (const auto& jn : jg["nodes"]) {
+            const int to_i = g.find_node(jn.value("name", ""));
+            if (to_i < 0) continue;
+            GraphNode* to = g.node_at(to_i);
+            if (!(jn.contains("sockets") && jn["sockets"].is_array())) continue;
+            for (const auto& js : jn["sockets"]) {
+                if (!js.contains("from")) continue;
+                const int from_i = g.find_node(js.value("from", ""));
+                const std::string sn = js.value("name", "");
+                if (from_i < 0) continue;
+                for (SockIn& sk : to->inputs) {
+                    if (sk.name == sn) {
+                        sk.link_node = from_i;
+                        sk.link_sock = js.value("from_socket", 0);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+nlohmann::json graphs_to_json(const std::vector<NodeGraph>& graphs) {
+    nlohmann::json arr = nlohmann::json::array();
+    for (const NodeGraph& g : graphs) arr.push_back(graph_to_json(g));
+    return arr;
+}
 
 std::vector<std::string> graph_node_types() {
     std::vector<std::string> out;
@@ -516,7 +770,19 @@ std::vector<std::pair<std::string, SockValue::Type>> graph_node_inputs(
     return out;
 }
 
-GraphResult evaluate_graph(const NodeGraph& g, int forced_output) {
+std::vector<std::pair<std::string, SockValue::Type>> graph_group_inputs(
+    const std::vector<NodeGraph>& all, const std::string& target) {
+    std::vector<std::pair<std::string, SockValue::Type>> out;
+    for (const NodeGraph& g : all) {
+        if (g.name != target) continue;
+        for (const GraphParam& p : g.params) out.emplace_back(p.name, p.type);
+        return out;
+    }
+    return out;
+}
+
+GraphResult evaluate_graph_in(const std::vector<NodeGraph>& all, const NodeGraph& g,
+                              int forced_output) {
     GraphResult r;
     if (g.nodes.empty()) {
         r.error = "the graph has no nodes";
@@ -541,7 +807,35 @@ GraphResult evaluate_graph(const NodeGraph& g, int forced_output) {
         r.failed_node = outn->name;
         return r;
     }
-    Evaluator ev(g);
+    // Cross-graph cycle check up front. Doing it here rather than with a stack in
+    // the evaluator means the message can name the whole path, and it costs one
+    // walk of the instantiation graph instead of a guard on every node visit.
+    {
+        std::vector<std::string> chain{g.name};
+        std::function<bool(const std::string&)> walk = [&](const std::string& name) {
+            for (const NodeGraph& cand : all) {
+                if (cand.name != name) continue;
+                for (const GraphNode& n : cand.nodes) {
+                    if (n.type != "group") continue;
+                    for (const std::string& open : chain) {
+                        if (open == n.target_graph) {
+                            r.error = "cycle: '" + n.name + "' in '" + name + "' instantiates '" +
+                                      n.target_graph + "', which is already being evaluated";
+                            r.failed_node = n.name;
+                            return true;
+                        }
+                    }
+                    chain.push_back(n.target_graph);
+                    if (walk(n.target_graph)) return true;
+                    chain.pop_back();
+                }
+            }
+            return false;
+        };
+        if (walk(g.name)) return r;
+    }
+
+    Evaluator ev(g, &all);
     if (!ev.eval(out_idx)) {
         r.error = ev.error;
         r.failed_node = ev.failed;
@@ -560,6 +854,12 @@ GraphResult evaluate_graph(const NodeGraph& g, int forced_output) {
     r.mesh = v.mesh;
     r.stats = mesh_stats(r.mesh);
     return r;
+}
+
+GraphResult evaluate_graph(const NodeGraph& g, int forced_output) {
+    // Single-graph convenience: the graph itself is the only catalog entry
+    // that `group` nodes can resolve against.
+    return evaluate_graph_in({g}, g, forced_output);
 }
 
 }  // namespace kiln

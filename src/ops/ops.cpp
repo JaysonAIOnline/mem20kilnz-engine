@@ -1834,7 +1834,7 @@ OpResult apply_op_impl(Document& doc, const nlohmann::json& op) {
             forced = resolve_graph_node(*g, op);
             if (forced < 0) return fail("graph_evaluate: " + graph_node_error(*g, op));
         }
-        const GraphResult r = evaluate_graph(*g, forced);
+        const GraphResult r = evaluate_graph_in(s.graphs, *g, forced);
         if (!r.ok) {
             std::string msg = "graph_evaluate: " + r.error;
             if (!r.failed_node.empty()) msg += " (at node '" + r.failed_node + "')";

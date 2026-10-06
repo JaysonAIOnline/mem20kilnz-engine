@@ -199,6 +199,9 @@ struct SockIn {
 struct GraphNode {
     std::string type;              ///< registry key
     std::string name;              ///< unique within the graph, for readable ops
+    /// For a `group` node, the graph it instantiates. Kept apart from the sockets
+    /// because it is structural rather than a value.
+    std::string target_graph;
     std::vector<SockIn> inputs;
     int x = 0, y = 0;              ///< layout, so a non-visual agent can place it
 };
@@ -206,10 +209,25 @@ struct GraphNode {
 /// A procedural graph. Evaluation is demand-driven from the output node and
 /// calls the real mesh operations, so a graph produces the same geometry the
 /// equivalent op sequence would.
+/// One exposed input of a graph, so another graph can instantiate it.
+///
+/// An entry names the socket it drives as well as the value, because a parameter
+/// is a binding, not a duplicate of the default: `graph_param graph=parts
+/// name=count node=gen socket=count` means "an instance may override gen.count".
+struct GraphParam {
+    std::string name;              ///< exposed name on the group node
+    SockValue::Type type = SockValue::Type::Float;
+    SockValue def;                 ///< value used when an instance does not override
+    std::string node;              ///< node inside this graph whose socket is driven
+    std::string socket;
+};
+
 struct NodeGraph {
     std::string name;
     std::vector<GraphNode> nodes;
     int output_node = -1;
+    /// Exposed inputs, used when another graph instantiates this one as a group.
+    std::vector<GraphParam> params;
     int find_node(const std::string& n) const;
     GraphNode* node_at(int i);
     const GraphNode* node_at(int i) const;
@@ -312,6 +330,23 @@ struct GraphResult {
     Mesh mesh;
     MeshStats stats;
 };
+
+/// Graph serialization, shared by the undo snapshot, the json sidecar and the
+/// glTF export so there is exactly one format and one implementation of it.
+nlohmann::json graph_to_json(const NodeGraph& g);
+nlohmann::json graphs_to_json(const std::vector<NodeGraph>& graphs);
+void graphs_from_json(const nlohmann::json& arr, std::vector<NodeGraph>& out);
+
+/// Sockets a `group` node instantiating `target` would expose: one per
+/// parameter of that graph. Empty if the graph does not exist.
+std::vector<std::pair<std::string, SockValue::Type>> graph_group_inputs(
+    const std::vector<NodeGraph>& all, const std::string& target);
+
+/// Evaluate `g` from its output node (or `forced_output` when >= 0), resolving
+/// `group` nodes against `all`. Reports the failing node and the reason rather
+/// than returning a partial mesh.
+GraphResult evaluate_graph_in(const std::vector<NodeGraph>& all, const NodeGraph& g,
+                              int forced_output = -1);
 
 /// Names of every registered node type, for discovery.
 std::vector<std::string> graph_node_types();

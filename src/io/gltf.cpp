@@ -374,6 +374,47 @@ bool export_gltf(const Scene& scene, const std::string& path, const GlbPreview& 
         g["scenes"][0]["nodes"].push_back(node_index[i]);
     }
 
+    // -- procedural graphs --------------------------------------------------
+    //
+    // The graph itself goes into the file, not only the mesh it evaluates to.
+    // Without this a procedural model is just a mesh: the recipe is lost, the file
+    // cannot be re-parameterised, and two files that look identical are
+    // indistinguishable. Graphs are named on the node that evaluated them, so the
+    // link between a graph and its result survives.
+    //
+    // Carried under a vendor extension rather than bare extras, with
+    // extensionsUsed naming it, so a reader that does not know the extension can
+    // tell the recipe apart from anything it invented.
+    if (!scene.graphs.empty()) {
+        g["extensionsUsed"] = nlohmann::json::array({"KHR_kiln_procedural"});
+        g["extensions"] = nlohmann::json::object();
+        nlohmann::json jk = nlohmann::json::object();
+        jk["graphs"] = graphs_to_json(scene.graphs);
+        jk["version"] = 1;
+        g["extensions"]["KHR_kiln_procedural"] = std::move(jk);
+
+        // Name the graph that produced each result node.
+        for (size_t i = 0; i < scene.nodes.size(); ++i) {
+            const Node& n = scene.nodes[i];
+            if (n.type != NodeType::Mesh) continue;
+            // The result node is named <graph>_result, which is how graph_evaluate
+            // names it, so the association is read back off the name.
+            const std::string suffix = "_result";
+            if (n.name.size() <= suffix.size()) continue;
+            const std::string base = n.name.substr(0, n.name.size() - suffix.size());
+            bool is_graph_result = false;
+            for (const NodeGraph& gr : scene.graphs) {
+                if (gr.name == base) is_graph_result = true;
+            }
+            if (!is_graph_result) continue;
+            if (i >= node_index.size() || node_index[i] < 0) continue;
+            g["nodes"][static_cast<size_t>(node_index[i])]["extensions"] =
+                nlohmann::json::object();
+            g["nodes"][static_cast<size_t>(node_index[i])]["extensions"]
+                 ["KHR_kiln_procedural"] = nlohmann::json::object({{"graph", base}});
+        }
+    }
+
     // -- animations ---------------------------------------------------------
     //
     // Written as glTF animation channels, one sampler per track. Times go in

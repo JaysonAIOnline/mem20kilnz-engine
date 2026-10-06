@@ -958,6 +958,35 @@ GltfImportStats import_gltf(Scene& scene, const std::string& path, std::string& 
     }
 
 
+    // -- procedural graphs -------------------------------------------------
+    //
+    // Read the recipes back so an imported file is re-parameterisable rather than
+    // just a mesh. Graphs already in the scene win: a re-import must not silently
+    // replace a graph the caller has been editing.
+    if (d.g.contains("extensions") && d.g["extensions"].is_array()) {
+        for (const auto& jg : d.g["extensions"]) {
+            if (!jg.contains("KHR_kiln_procedural")) continue;
+            const auto& ext = jg["KHR_kiln_procedural"];
+            if (!ext.contains("graphs")) continue;
+            std::vector<NodeGraph> incoming;
+            graphs_from_json(ext["graphs"], incoming);
+            for (const NodeGraph& g : incoming) {
+                if (scene.find_graph(g.name) < 0) scene.graphs.push_back(g);
+            }
+        }
+    }
+    if (d.g.contains("extensions") && d.g["extensions"].is_object()) {
+        const auto& je = d.g["extensions"];
+        if (je.contains("KHR_kiln_procedural") &&
+            je["KHR_kiln_procedural"].contains("graphs")) {
+            std::vector<NodeGraph> incoming;
+            graphs_from_json(je["KHR_kiln_procedural"]["graphs"], incoming);
+            for (const NodeGraph& g : incoming) {
+                if (scene.find_graph(g.name) < 0) scene.graphs.push_back(g);
+            }
+        }
+    }
+
     stats.nodes = static_cast<int>(scene.nodes.size());
     stats.meshes = static_cast<int>(scene.meshes.size());
     stats.primitives = stats.meshes;
